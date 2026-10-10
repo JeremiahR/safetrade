@@ -1,0 +1,48 @@
+#cloud-config
+# Provisioning for the SafeTrade market-making host.
+#
+# Note on time: the exchange authenticates with a millisecond nonce and rejects
+# anything more than a few seconds off its own clock (`authz.nonce_expired`).
+# Accurate time is a hard requirement here, not hygiene, so chrony goes on
+# first and we verify it in the deploy script.
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - chrony
+  - sqlite3
+  - ca-certificates
+  - ufw
+  - fail2ban
+  - unattended-upgrades
+  - curl
+  - jq
+
+users:
+  - name: safetrade
+    system: true
+    home: /opt/safetrade
+    shell: /usr/sbin/nologin
+
+write_files:
+  # 512MB of RAM is enough to run the bot but not to survive a spike; swap
+  # turns a would-be OOM kill into a slowdown.
+  - path: /etc/sysctl.d/99-swap.conf
+    content: |
+      vm.swappiness=10
+
+runcmd:
+  - [ systemctl, enable, --now, chrony ]
+  - [ timedatectl, set-ntp, "true" ]
+  - fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
+  - echo '/swapfile none swap sw 0 0' >> /etc/fstab
+  - mkdir -p /opt/safetrade/bin /opt/safetrade/data /opt/safetrade/etc
+  - chown -R safetrade:safetrade /opt/safetrade
+  - chmod 750 /opt/safetrade/etc
+  - [ ufw, default, deny, incoming ]
+  - [ ufw, default, allow, outgoing ]
+  - [ ufw, allow, "22/tcp" ]
+  - [ ufw, --force, enable ]
+  - [ systemctl, enable, --now, fail2ban ]
+  - [ systemctl, enable, --now, unattended-upgrades ]

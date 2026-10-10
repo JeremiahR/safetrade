@@ -1,0 +1,59 @@
+[Unit]
+Description=SafeTrade execution / market-making bot
+Documentation=https://github.com/JeremiahR/safetrade
+After=network-online.target time-sync.target
+# Private API auth signs a millisecond nonce, so a wrong clock fails every
+# request. Wait for time sync before starting.
+#
+# `time-sync.target` rather than `chrony.service`: the generic target is
+# satisfied by whichever sync daemon the host runs, and Ubuntu 24.04 ships
+# systemd-timesyncd, not chrony. A hard `Requires=chrony.service` on a host
+# without it does not degrade -- it refuses to start the bot at all, with
+# "Unit chrony.service not found", which reads as a broken unit file.
+#
+# Wants, not Requires, for the same reason: an unsynced clock fails loudly and
+# immediately on the first private call and the unit restarts, whereas a
+# missing dependency leaves the bot silently down.
+Wants=network-online.target time-sync.target
+# NO start limit.
+#
+# Startup needs the exchange: credentials are checked and every market is
+# listed. A Cloudflare block or an exchange maintenance window fails fast, so
+# with a 5-in-5-minutes limit the unit would exhaust its restarts in about a
+# minute and enter `failed` PERMANENTLY -- and the process that would have
+# raised the alarm is the one that is dead. An outage must cost us quoting,
+# not the bot.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=safetrade
+Group=safetrade
+WorkingDirectory=/opt/safetrade
+EnvironmentFile=/opt/safetrade/etc/safetrade.env
+ExecStart=/opt/safetrade/bin/safetrade --config /opt/safetrade/etc/config.toml run
+
+Restart=always
+# Long enough that a persistent outage retries at a civilised rate rather than
+# hammering the exchange while it is already unwell.
+RestartSec=30
+# SIGTERM makes the bot cancel every resting order before exiting. Give it room
+# to finish; being killed with quotes live on the book is the worst outcome.
+KillSignal=SIGTERM
+TimeoutStopSec=90
+KillMode=mixed
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=/opt/safetrade/data
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

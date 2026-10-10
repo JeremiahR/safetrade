@@ -1,0 +1,38 @@
+[package]
+name = "safetrade"
+version = "0.1.0"
+edition = "2024"
+description = "Execution and market-making bot for SafeTrade"
+license = "MIT"
+repository = "https://github.com/JeremiahR/safetrade"
+
+[dependencies]
+anyhow = "1.0.104"
+chrono = "0.4.45"
+clap = { version = "4.6.7", features = ["derive"] }
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
+hex = "0.4.3"
+hmac = "0.13.0"
+rand = "0.10.3"
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls", "gzip", "http2", "charset", "system-proxy", "query"] }
+rust_decimal = { version = "1.43.0", features = ["serde-with-str", "maths"] }
+rust_decimal_macros = "1.40.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "sqlite", "sqlite-bundled", "tls-none", "chrono", "json", "migrate", "macros", "derive"] }
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "signal", "time", "sync", "fs"] }
+toml = "1.1.6"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }
+
+[profile.release]
+opt-level = 3
+# Default codegen-units on purpose: raising it trades a little runtime speed for
+# much lower peak memory, which is what lets the 512MB host build at all.
+strip = true
+
+[dev-dependencies]
+tempdir = "0.3.7"
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "time"] }

@@ -1,0 +1,7 @@
+[Unit]
+Description=Check that the SafeTrade bot is still ticking
+After=safetrade.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/safetrade/bin/heartbeat-check.sh

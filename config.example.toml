@@ -1,0 +1,134 @@
+# SafeTrade bot configuration.
+#
+# Structural settings live here and take effect on restart. Anything you want
+# to change on a running bot lives in the database instead — see
+# `safetrade ctl set` for the list.
+#
+# Credentials are NEVER read from this file. Put them in .env or the systemd
+# environment file:
+#   SAFETRADE_API_KEY=...
+#   SAFETRADE_API_SECRET=...
+
+market = "prlusdt"
+db_path = "data/safetrade.db"
+
+# Seconds between quote refreshes.
+#
+# Four API calls go out per loop, so this sets the request rate: 6s is about
+# 0.7/sec. Cloudflare sits in front of this exchange and starts returning bare
+# 403s when pushed, which costs a whole loop each time. This strategy quotes
+# passively and its orders rest for minutes, so there is no edge in polling
+# harder and a real cost to it.
+loop_secs = 6
+
+# Order book levels to pull each loop.
+depth_levels = 50
+
+# Days of book snapshots and events to keep before pruning.
+retain_days = 30
+
+# Seconds between unprompted Telegram status messages. Telegram is enabled by
+# setting TELEGRAM_BOT_TOKEN in the environment; the first /start sent to the
+# bot claims it, and every other chat is ignored from then on.
+telegram_status_secs = 3600
+
+
+[quoting]
+# Rungs per side.
+levels = 3
+
+# Base order size per rung, in base currency (PRL).
+size_base = 250
+
+# ---------------------------------------------------------------------------
+# IMPORTANT, PRL/USDT specifically: price precision is 2 decimals, so one tick
+# is 0.01 on a coin trading near 1.00. **One tick is about 1%.** Every setting
+# below measured in ticks is therefore a ~1% decision. The book is currently
+# 0.98 bid / 1.00 ask, which is a two-tick spread with exactly one free price
+# level between the two sides.
+# ---------------------------------------------------------------------------
+
+# Gap between rungs, in ticks.
+level_step_ticks = 1
+
+# Size multiplier per rung further from the touch.
+level_size_growth = 1.5
+
+# Minimum half-spread from fair value, in ticks.
+min_half_spread_ticks = 0.5
+
+# How hard inventory error pushes the quoted prices, in ticks at full error.
+# Higher pulls inventory back to target faster and earns less spread.
+inventory_skew_ticks = 1.5
+
+# How hard inventory error skews the two sides' sizes, 0..1.
+inventory_size_skew = 0.8
+
+# The inventory error, in base currency, at which the two skews above reach
+# full strength. 0 derives it from the target: `inventory_scale_pct` of it,
+# 10% by default.
+#
+# This is the scale that makes the skews mean anything, and it is worth
+# understanding before changing. Leaning is the mechanism behind BOTH the TWAP
+# catch-up and the rebalance: the bot does not have a scheduler, it just quotes
+# harder on the side that closes the gap to target. Set this too large and the
+# lean rounds away to nothing and the bot quotes symmetrically; set it too
+# small and it slams from one side to the other on small inventory wobbles.
+inventory_scale = 0
+
+# Ticks we may post BETTER than the current touch.
+#
+# This is the main "don't move the price" control. At 0 the bot will join the
+# best bid but never outbid it, so its quoting cannot by itself move the
+# displayed price. Raise it only if you have decided you want to move the
+# market — on this pair each tick is a ~1% step.
+max_improve_ticks = 0
+
+# Cross the spread to keep a schedule. Off by default: taking liquidity is
+# precisely how you move the price.
+allow_taker = false
+
+# Cap a single order at this fraction of the quote-denominated depth resting
+# within depth_band of the touch. Being most of a thin book is the fastest way
+# to move it.
+max_order_pct_of_depth = 0.15
+depth_band = 0.05
+
+# Our maximum share of traded volume over the window. Exceed it and the bot
+# stands down until the window clears. This is the TWAP's main defence against
+# becoming the whole tape.
+max_participation = 0.15
+participation_window_secs = 900
+
+# How far an order's size may drift before it is worth cancelling and
+# replacing. Replacing costs queue priority, which on a thin book is most of
+# the edge, so this is deliberately loose.
+size_tolerance = 0.25
+
+# Randomise sizes by up to this fraction so the ladder does not read as a bot.
+size_jitter = 0.12
+
+# Cancel/replace pairs per loop.
+max_actions_per_loop = 8
+
+
+[risk]
+# Hard inventory bounds, base currency. The bot will not place an order that
+# could carry it outside these.
+max_position = 100000
+min_position = 0
+
+# Pause quoting if fair value moves more than this fraction inside the window.
+max_move = 0.15
+vol_window_secs = 300
+
+# Hard cap on a single order's quote-currency notional.
+max_order_notional = 500
+
+# Held back from quoting, so a fat finger elsewhere cannot drain the account.
+reserve_quote = 0
+reserve_base = 0
+
+# Absolute price guards. Uncomment to refuse to quote outside a band.
+# price_floor = 0.50
+# price_ceiling = 2.00

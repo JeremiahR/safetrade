@@ -1,0 +1,10 @@
+/target
+*.db
+*.db-shm
+*.db-wal
+/data
+.env
+config.local.toml
+report*.html
+/config.toml
+deploy/config.prod.toml
