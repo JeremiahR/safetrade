@@ -1107,7 +1107,8 @@ impl Db {
             "SELECT client_id, exchange_id, program_id, market, side, price, amount,
                     filled_amount, state, level, placed_at
              FROM orders
-             WHERE market = ? AND state IN ('wait','pending') AND exchange_id IS NOT NULL",
+             WHERE market = ? AND state IN ('wait','pending') AND exchange_id IS NOT NULL
+               AND client_id NOT LIKE 'adopted-%'",
         )
         .bind(market)
         .fetch_all(&self.pool)
@@ -1145,6 +1146,108 @@ impl Db {
         .bind(exchange_id)
         .fetch_optional(&self.pool)
         .await?)
+    }
+
+    /// The lowest mid this book showed in the last hour, from the snapshots.
+    pub async fn hour_low(&self, market: &str) -> Option<Decimal> {
+        let mids: Vec<(Option<String>,)> =
+            sqlx::query_as("SELECT mid FROM book_snapshots WHERE market = ? AND ts >= ?")
+                .bind(market)
+                .bind(now_ms() - 3_600_000)
+                .fetch_all(&self.pool)
+                .await
+                .ok()?;
+        mids.iter()
+            .filter_map(|(m,)| num::opt_parse(m.as_deref()))
+            .filter(|m| *m > Decimal::ZERO)
+            .min()
+    }
+
+    /// Base volume on the recorded public tape since `since_ms`.
+    pub async fn tape_volume(&self, market: &str, since_ms: i64) -> Result<Decimal> {
+        let rows: Vec<(String,)> = sqlx::query_as("SELECT amount FROM tape WHERE market = ? AND ts >= ?")
+            .bind(market)
+            .bind(since_ms)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.iter().map(|(a,)| num::parse(a)).sum())
+    }
+
+    /// Whether a restart should leave this book's orders resting.
+    ///
+    /// True while the asset runs a slow sell (owner, 2026-10-10: "let the
+    /// restart leave orders up"). Its asks are passive and over the floor, so
+    /// unmanaged for the seconds of a restart the worst they do is fill at a
+    /// price we wanted; cancelling them throws away their place in the queue
+    /// on every deploy. The new process recognises them from the orders table.
+    pub async fn keeps_orders_on_restart(&self, market: &str) -> bool {
+        let Ok(Some(base)) = self.get_setting(&format!("base_unit:{market}")).await else {
+            return false;
+        };
+        matches!(
+            self.active_program(&base).await,
+            Ok(Some(p)) if p.kind == crate::db::models::ProgramKind::TwapSell
+        )
+    }
+
+    /// Taker volume on the recorded tape since `since_ms`: (bought, sold),
+    /// where "bought" is a buyer lifting an ask.
+    pub async fn taker_flow(&self, market: &str, since_ms: i64) -> Result<(Decimal, Decimal)> {
+        let rows: Vec<(String, Option<String>)> =
+            sqlx::query_as("SELECT amount, taker FROM tape WHERE market = ? AND ts >= ?")
+                .bind(market)
+                .bind(since_ms)
+                .fetch_all(&self.pool)
+                .await?;
+        let (mut buy, mut sell) = (Decimal::ZERO, Decimal::ZERO);
+        for (a, t) in rows {
+            match t.as_deref() {
+                Some("buy") => buy += num::parse(&a),
+                Some("sell") => sell += num::parse(&a),
+                _ => {}
+            }
+        }
+        Ok((buy, sell))
+    }
+
+    /// Base we sold on `market` since `since_ms`, every fill counted.
+    pub async fn sold_since(&self, market: &str, since_ms: i64) -> Result<Decimal> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT amount FROM fills WHERE market = ? AND side = 'sell' AND created_at >= ?",
+        )
+        .bind(market)
+        .bind(since_ms)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(|(a,)| num::parse(a)).sum())
+    }
+
+    /// A recent placement of ours that never got an exchange id -- the request
+    /// timed out or errored, but the order may have reached the book anyway.
+    /// Matched on market, side, price and size, newest first, within the hour.
+    pub async fn claim_unattached_placement(
+        &self,
+        market: &str,
+        side: Side,
+        price: Decimal,
+        amount: Decimal,
+    ) -> Result<Option<OrderRow>> {
+        let rows: Vec<OrderRow> = sqlx::query_as(
+            "SELECT client_id, exchange_id, program_id, market, side, price, amount,
+                    filled_amount, state, level, placed_at
+             FROM orders
+             WHERE market = ? AND side = ? AND exchange_id IS NULL
+               AND state IN ('pending','reject') AND placed_at >= ?
+             ORDER BY placed_at DESC",
+        )
+        .bind(market)
+        .bind(side.as_str())
+        .bind(now_ms() - 3_600_000)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().find(|r| {
+            num::opt_parse(r.price.as_deref()) == Some(price) && num::parse(&r.amount) == amount
+        }))
     }
 
     /// Put an order back on the live books after the exchange showed it is

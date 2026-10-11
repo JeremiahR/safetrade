@@ -102,6 +102,7 @@ impl Leg {
     /// The leg's yield discounted for how little we know about it. A leg with
     /// no fills is worth nothing rather than zero, which matters because zero
     /// would read as "free" on a release leg.
+    #[cfg(test)]
     pub fn lower_bound(&self) -> Decimal {
         if self.n == 0 {
             return Decimal::ZERO;

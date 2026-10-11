@@ -5,7 +5,7 @@
 //! we cancel *before* placing so a replace cannot momentarily double our
 //! exposure at a price level.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::Duration;
@@ -22,6 +22,7 @@ use crate::exchange::{ApiError, Balance, Client, Market, OrderBook, Side};
 use crate::num;
 use crate::strategy::allocation;
 use crate::strategy::arms::{self, ArmScales, ArmSize, Book, State};
+use crate::strategy::quote::Halt;
 use crate::strategy::{Decision, DesiredQuote, QuoteInput, plan};
 
 pub struct Engine {
@@ -38,6 +39,8 @@ pub struct Engine {
     dry_run: bool,
     /// Rolling fair-value history per market, for the volatility breaker.
     fv_history: HashMap<String, Vec<(i64, Decimal)>>,
+    /// When each book's slow sell last re-planned. See `SELL_EVERY_SECS`.
+    sell_planned: HashMap<String, i64>,
     last_prune: i64,
     /// Last balance we wrote per currency, so unchanged balances are not
     /// re-recorded every loop. Writing two rows every four seconds for a number
@@ -70,6 +73,9 @@ pub struct Engine {
     /// Markets currently standing down, and why. Keyed so the alert fires on
     /// the way in and the way out, not on every loop between.
     halted: HashMap<String, String>,
+    /// Orders on the exchange that are not ours -- placed by hand. Seen once
+    /// so the log says so once, then left alone for good.
+    foreign_orders: HashSet<i64>,
     last_transfer_check: i64,
     transfer_checks: u32,
     /// Consecutive per-market API failures. A book we cannot see is a book
@@ -136,6 +142,15 @@ const DRIFT_HALF_LIVES: i64 = 2;
 /// The settings the bot last went live with, as `strategy_fingerprint` sees
 /// them. A different fingerprint at start-up is a settings change, and a
 /// settings change restarts the scoreboard.
+/// The slow sell's floor when its program carries no limit: never sell PRL
+/// below this. A program's `limit_price` overrides it.
+const SELL_FLOOR: Decimal = dec!(1.30);
+
+/// How often the slow sell re-plans its asks, by default (`sell_every_secs`).
+/// The loop still runs every few seconds for fills, commands and pause; only
+/// the ask placement waits. The owner, 2026-10-10: "20 seconds is aggressive".
+const SELL_EVERY_SECS: i64 = 120;
+
 const CONFIG_LIVE_KEY: &str = "config_live";
 
 /// One page of our own trades, and how many pages we will walk in a loop.
@@ -342,6 +357,7 @@ impl Engine {
             markets,
             dry_run,
             fv_history: HashMap::new(),
+            sell_planned: HashMap::new(),
             last_prune: 0,
             last_balances: HashMap::new(),
             last_balance_write: 0,
@@ -351,6 +367,7 @@ impl Engine {
             loop_n: 0,
             order_state: HashMap::new(),
             halted: HashMap::new(),
+            foreign_orders: HashSet::new(),
             last_transfer_check: 0,
             transfer_checks: 0,
             market_failures: HashMap::new(),
@@ -576,6 +593,12 @@ impl Engine {
         balances: &[Balance],
         public: &HashMap<String, OrderBook>,
     ) -> Result<Option<&'static str>> {
+        // Paused means no orders of any kind. This swap ran on through a pause
+        // on 2026-10-02 and crossed most of the USDT into USDC after the owner
+        // had pressed the button, because only the quoting checked the switch.
+        if !params.enabled {
+            return Ok(Some("paused"));
+        }
         if !params.q.cycle_recycle {
             return Ok(Some("cycle_recycle is off"));
         }
@@ -911,6 +934,10 @@ impl Engine {
         self.db.log("info", "shutdown", "cancelling all orders", None).await;
         if !self.dry_run {
             for m in self.markets.clone() {
+                if self.db.keeps_orders_on_restart(&m.id).await {
+                    info!(market = %m.id, "slow sell: leaving our orders resting through the restart");
+                    continue;
+                }
                 if let Err(e) = self.cancel_everything(&m.id).await {
                     error!(market = %m.id, error = ?e,
                            "failed to cancel on shutdown — CHECK THE EXCHANGE MANUALLY");
@@ -1388,7 +1415,7 @@ impl Engine {
             for m in &self.markets {
                 if matches!(
                     self.db.active_program(&m.base_unit).await,
-                    Ok(Some(p)) if p.kind == ProgramKind::Twap
+                    Ok(Some(p)) if p.kind.is_twap()
                 ) {
                     keep.push(m.clone());
                 }
@@ -1536,7 +1563,27 @@ impl Engine {
         // sides. See `Quoting::cycle_churn`.
         let cycle_churn = self.cycle_churn(&market.id, &params);
 
-        let decision = plan(&QuoteInput {
+        let sell = program.as_ref().filter(|p| p.kind == ProgramKind::TwapSell);
+        if sell.is_some() {
+            // Between passes the asks are left alone. A pause or a hold acts
+            // at once, never waiting out the interval.
+            let every = self.db.setting_decimal("sell_every_secs", Decimal::from(SELL_EVERY_SECS)).await;
+            let every_ms = i64::try_from(every.round()).unwrap_or(SELL_EVERY_SECS).max(5) * 1000;
+            let last = self.sell_planned.get(&market.id).copied().unwrap_or(0);
+            let stop = !params.enabled || self.db.setting_bool("twap_hold", false).await;
+            // An ask that filled since the last pass is refilled now, not up
+            // to two minutes later: a sweep is when the buying is there.
+            let filled = last > 0
+                && self.db.sold_since(&market.id, last).await.unwrap_or_default() > Decimal::ZERO;
+            if !stop && !filled && now_ms() - last < every_ms {
+                return Ok(());
+            }
+            self.sell_planned.insert(market.id.clone(), now_ms());
+        }
+        let decision = if let Some(p) = sell {
+            self.plan_sell(market, &public_book, live, p, &params, base_avail, inventory).await
+        } else {
+            plan(&QuoteInput {
             cycle_release_floor,
             cycle_churn,
             market,
@@ -1554,7 +1601,63 @@ impl Engine {
             reference_required,
             arms,
             now_ms: now_ms(),
-        });
+        })
+        };
+
+        // In TWAP mode the stablecoin book would stand down. Instead, if the
+        // owner has set a minimum, it sells its USDC for USDT at that price or
+        // better (2026-10-10: "opportunistically convert usdc to usdt").
+        let decision = match &decision.halt {
+            Some(Halt::TwapOnly) if params.enabled && market.base_unit == "usdc" && market.quote_unit == "usdt" => {
+                let min = self.db.setting_decimal("usdc_convert_min", dec!(1.0010)).await;
+                let own: Decimal = live.iter().filter(|o| o.side == Side::Sell).map(|o| o.remaining()).sum();
+                match crate::strategy::sell::convert_ask(
+                    market,
+                    public_book.best_bid().map(|(p, _)| p),
+                    public_book.best_ask().map(|(p, _)| p),
+                    base_avail + own,
+                    min,
+                ) {
+                    Some(q) => {
+                        info!(market = %market.id, price = %q.price, amount = %q.amount, %min, "converting usdc");
+                        Decision { quotes: vec![q], halt: None, fair_value: public_book.mid(), target_inventory: inventory }
+                    }
+                    None => decision,
+                }
+            }
+            _ => decision,
+        };
+
+        // A twap may stand down on its own: by hand (`twap_hold`), or for a
+        // breather after price ran up more than `twap_spike_pct` in an hour.
+        // Asked for on 2026-10-07: do not chase a spike with the whole purse.
+        // It clears by itself once the hour's low catches up or price falls.
+        let decision = match program.as_ref() {
+            Some(p) if p.kind.is_twap() && decision.halt.is_none() => {
+                if self.db.setting_bool("twap_hold", false).await {
+                    Decision::halted(Halt::TwapHeld, decision.target_inventory)
+                } else if p.kind == ProgramKind::TwapSell {
+                    // The spike guard is for buying. A spike is what the slow
+                    // sell is waiting for.
+                    decision
+                } else {
+                    let pct = self.db.setting_decimal("twap_spike_pct", dec!(5)).await;
+                    match (pct > Decimal::ZERO, decision.fair_value) {
+                        (true, Some(fv)) => match self.db.hour_low(&market.id).await {
+                            Some(low) if low > Decimal::ZERO && (fv - low) / low * dec!(100) > pct => {
+                                Decision::halted(
+                                    Halt::TwapSpike { rise: (fv - low) / low },
+                                    decision.target_inventory,
+                                )
+                            }
+                            _ => decision,
+                        },
+                        _ => decision,
+                    }
+                }
+            }
+            _ => decision,
+        };
 
         self.db
             .snapshot_book(
@@ -1597,6 +1700,16 @@ impl Engine {
                 .await;
         }
 
+        // A twap grows its bid by STACKING orders at the best bid, never by
+        // replacing: a resized order goes to the back of the queue.
+        let mut decision = decision;
+        if program.as_ref().is_some_and(|p| p.kind == ProgramKind::Twap) {
+            decision.quotes = twap_stack(
+                &decision.quotes, live, decision.target_inventory, inventory, quote_avail,
+                market.amount_precision,
+            );
+        }
+
         // Reserve what we are about to commit so later markets see it gone.
         for q in &decision.quotes {
             match q.side {
@@ -1628,7 +1741,7 @@ impl Engine {
         // the spread to keep a schedule the passive ladder cannot keep. After
         // the ladder, so the crossing is sized against what the rungs did not
         // already commit, and bounded by every cap in `take_if_behind`.
-        if let (Some(p), Some(fv)) = (program.as_ref(), decision.fair_value) {
+        if let (Some(p), Some(fv)) = (program.as_ref().filter(|p| p.kind != ProgramKind::TwapSell), decision.fair_value) {
             self.take_if_behind(
                 market,
                 &public_book,
@@ -1655,6 +1768,98 @@ impl Engine {
             "tick"
         );
         Ok(())
+    }
+
+    /// The slow sell's decision for one book: small asks joined to the
+    /// strangers' lowest levels, capped by the tape. See `strategy::sell`.
+    ///
+    /// It skips `plan` and its breakers on purpose. The volatility breaker
+    /// stands down exactly when a sweep comes through, and the floor already
+    /// keeps it from selling cheap.
+    #[allow(clippy::too_many_arguments)]
+    async fn plan_sell(
+        &self,
+        market: &Market,
+        book: &OrderBook,
+        live: &[crate::db::models::LiveOrder],
+        program: &Program,
+        params: &Params,
+        base_avail: Decimal,
+        inventory: Decimal,
+    ) -> Decision {
+        if !params.enabled {
+            return Decision::halted(Halt::Disabled, inventory);
+        }
+        let best_bid = book.best_bid().map(|(p, _)| p);
+        if best_bid.is_none() && book.asks.is_empty() {
+            return Decision::halted(Halt::EmptyBook, inventory);
+        }
+        let now = now_ms();
+        let (day_ago, hour_ago) = (now - 86_400_000, now - 3_600_000);
+        let pct = |v: Decimal| v / dec!(100);
+        let count = |v: Decimal, d: usize| v.round().to_string().parse::<usize>().unwrap_or(d).min(50);
+        let d = crate::strategy::sell::SellParams::default();
+        let sp = crate::strategy::sell::SellParams {
+            day_rate: pct(self.db.setting_decimal("sell_day_pct", d.day_rate * dec!(100)).await),
+            hour_rate: pct(self.db.setting_decimal("sell_hour_pct", d.hour_rate * dec!(100)).await),
+            levels: count(self.db.setting_decimal("sell_levels", Decimal::from(d.levels)).await, d.levels),
+            keep_levels: count(self.db.setting_decimal("sell_keep_levels", Decimal::from(d.keep_levels)).await, d.keep_levels),
+            level_share: pct(self.db.setting_decimal("sell_level_pct", d.level_share * dec!(100)).await),
+            max_order: self.db.setting_decimal("sell_max_order", d.max_order).await,
+            min_order: d.min_order,
+            stand_back: self.db.setting_decimal("sell_stand_back", d.stand_back).await,
+            boost_price: self.db.setting_decimal("sell_boost_price", d.boost_price).await,
+            boost: self.db.setting_decimal("sell_boost", d.boost).await,
+            ..d
+        };
+        // Who is trading, over every book on this asset: the deep book's
+        // flow is the signal for the thin one too.
+        let flow_mins = self.db.setting_decimal("sell_flow_mins", dec!(10)).await;
+        let since = now - i64::try_from((flow_mins * dec!(60000)).round()).unwrap_or(600_000);
+        let (mut bought, mut sold) = (Decimal::ZERO, Decimal::ZERO);
+        for m in self.markets.iter().filter(|m| m.base_unit == market.base_unit) {
+            if let Ok((b, s)) = self.db.taker_flow(&m.id, since).await {
+                bought += b;
+                sold += s;
+            }
+        }
+        // Too little traded to say who is driving: no opinion.
+        let flow = (bought + sold >= self.db.setting_decimal("sell_flow_min_volume", dec!(1000)).await)
+            .then(|| (bought - sold) / (bought + sold));
+        let resting: Vec<crate::strategy::sell::Resting> = live
+            .iter()
+            .filter(|o| o.side == Side::Sell)
+            .map(|o| crate::strategy::sell::Resting { price: o.price, remaining: o.remaining() })
+            .collect();
+        let input = crate::strategy::sell::SellInput {
+            market,
+            asks: &book.asks,
+            best_bid,
+            floor: program.limit_price.unwrap_or(SELL_FLOOR),
+            volume_24h: self.db.tape_volume(&market.id, day_ago).await.unwrap_or_default(),
+            sold_24h: self.db.sold_since(&market.id, day_ago).await.unwrap_or_default(),
+            volume_1h: self.db.tape_volume(&market.id, hour_ago).await.unwrap_or_default(),
+            sold_1h: self.db.sold_since(&market.id, hour_ago).await.unwrap_or_default(),
+            free: base_avail,
+            resting: &resting,
+            flow,
+            seed: now as u64 ^ market.id.bytes().fold(0u64, |a, b| a.wrapping_mul(131).wrapping_add(b as u64)),
+            params: sp,
+        };
+        let quotes = crate::strategy::sell::ladder(&input);
+        info!(
+            market = %market.id, floor = %input.floor, best_ask = ?book.best_ask().map(|(p, _)| p),
+            volume_24h = %input.volume_24h.round_dp(0), sold_24h = %input.sold_24h.round_dp(0),
+            volume_1h = %input.volume_1h.round_dp(0), sold_1h = %input.sold_1h.round_dp(0),
+            room = %input.room().round_dp(0), resting = resting.len(), asks = quotes.len(),
+            flow = ?flow.map(|f| f.round_dp(2)), flow_scale = %input.flow_scale().round_dp(2),
+            "slow sell"
+        );
+        let fair_value = match (best_bid, book.best_ask().map(|(p, _)| p)) {
+            (Some(b), Some(a)) => Some((b + a) / Decimal::TWO),
+            (b, a) => b.or(a),
+        };
+        Decision { quotes, halt: None, fair_value, target_inventory: inventory }
     }
 
     /// Move newly earned edge into the base asset's pile, if the program is
@@ -2442,7 +2647,7 @@ impl Engine {
     /// than leaving it resting. That does mean an order placed by hand in the
     /// SafeTrade UI will be treated as the bot's and likely cancelled.
     async fn reconcile_view(
-        &self,
+        &mut self,
         market: &Market,
         exchange_orders: &[crate::exchange::Order],
     ) -> Result<Vec<crate::db::models::LiveOrder>> {
@@ -2493,41 +2698,38 @@ impl Engine {
                 continue;
             }
 
-            // Genuinely unknown: placed by hand, or placed by us in a run whose
-            // record was lost. Adopt it so it cannot rest unmanaged, and say so
-            // -- this one is worth hearing about.
-            warn!(
-                market = %market.id, id = o.id, %side, %price,
-                amount = %o.origin_amount,
-                "adopting an order the exchange reports but we have no record of"
-            );
-            self.db
-                .alert(
-                    "adopted_order",
-                    &format!(
-                        "Found an untracked {side} order {} @ {price} on {} and adopted it.",
-                        o.origin_amount, market.id
-                    ),
-                )
-                .await;
-            let client_id = format!("adopted-{}", o.id);
-            self.db
-                .record_placement(
-                    &client_id, None, &market.id, side, price, o.origin_amount, -1, None, None, None,
-                )
-                .await
-                .ok();
-            self.db.attach_exchange_id(&client_id, o.id, &o.state).await.ok();
-            out.push(crate::db::models::LiveOrder {
-                client_id,
-                exchange_id: o.id,
-                side,
-                price,
-                amount: o.origin_amount,
-                filled: o.filled_amount,
-                level: -1,
-                placed_at: now_ms(),
-            });
+            // A placement of ours whose answer never came back?
+            if let Some(row) = self
+                .db
+                .claim_unattached_placement(&market.id, side, price, o.origin_amount)
+                .await?
+            {
+                info!(
+                    market = %market.id, id = o.id, client_id = %row.client_id,
+                    "matched a resting order to a placement whose reply was lost"
+                );
+                self.db.attach_exchange_id(&row.client_id, o.id, &o.state).await.ok();
+                out.push(crate::db::models::LiveOrder {
+                    client_id: row.client_id,
+                    exchange_id: o.id,
+                    side,
+                    price,
+                    amount: o.origin_amount,
+                    filled: o.filled_amount,
+                    level: row.level.unwrap_or(-1),
+                    placed_at: row.placed_at,
+                });
+                continue;
+            }
+
+            // Placed by hand. Not ours to manage, and never ours to cancel.
+            if self.foreign_orders.insert(o.id) {
+                info!(
+                    market = %market.id, id = o.id, %side, %price,
+                    amount = %o.origin_amount,
+                    "leaving a manual order alone"
+                );
+            }
         }
         Ok(out)
     }
@@ -2677,7 +2879,14 @@ impl Engine {
             params.risk.max_order_notional
         };
         let notional = want.price * want.amount;
-        if notional > cap {
+        // A twap's bids have no size cap: the owner wants the stack at the
+        // touch to grow as long as it goes unfilled (2026-10-07). In twap
+        // mode every bid on the book is a twap bid, and only cash bounds it.
+        let twap_bid = params.q.twap_only && want.side == Side::Buy;
+        // Nor do the slow sell's asks: in twap mode an ask can only be one of
+        // them, and its rungs are sized off the day's volume, not this cap.
+        let twap_ask = params.q.twap_only && want.side == Side::Sell;
+        if notional > cap && !twap_bid && !twap_ask {
             warn!(%notional, %cap, deep, "refusing order over the notional cap");
             return;
         }
@@ -2727,25 +2936,23 @@ impl Engine {
         }
     }
 
+    /// Cancel every order WE have resting on `market`, one at a time.
+    ///
+    /// Never the exchange's cancel-all: that takes the owner's hand-placed
+    /// orders with it, and it did, on every pause and every restart.
     async fn cancel_everything(&self, market: &str) -> Result<()> {
-        match self.api.cancel_all(market).await {
-            Ok(orders) => {
-                for o in &orders {
-                    self.db.mark_cancelled(o.id).await.ok();
+        let ours = self.db.live_orders(market).await?;
+        let mut n = 0;
+        for o in &ours {
+            match self.api.cancel(o.exchange_id).await {
+                Ok(_) => {
+                    self.db.mark_cancelled(o.exchange_id).await.ok();
+                    n += 1;
                 }
-                info!(count = orders.len(), "cancelled all resting orders");
-            }
-            Err(e) => {
-                // Fall back to cancelling one by one; leaving orders resting
-                // after a halt is the outcome we most want to avoid.
-                warn!(error = ?e, "bulk cancel failed, falling back to individual cancels");
-                for o in self.db.live_orders(market).await.unwrap_or_default() {
-                    if self.api.cancel(o.exchange_id).await.is_ok() {
-                        self.db.mark_cancelled(o.exchange_id).await.ok();
-                    }
-                }
+                Err(e) => warn!(market, id = o.exchange_id, error = %format!("{e:#}"), "cancel failed"),
             }
         }
+        info!(market, count = n, of = ours.len(), "cancelled our resting orders");
         Ok(())
     }
 
@@ -3132,7 +3339,7 @@ impl Engine {
                     .context("program needs a valid kind")?;
                 // A twap needs no target typed: it works the whole account in.
                 let requested = match kind {
-                    ProgramKind::Twap => Decimal::ZERO,
+                    ProgramKind::Twap | ProgramKind::TwapSell => Decimal::ZERO,
                     _ => dec_arg("target").context("program needs a target")?,
                 };
                 // Programs are filed per asset, so a command may name one.
@@ -3195,7 +3402,14 @@ impl Engine {
                 // other program clears it: the alternative is a bot that looks
                 // like it is market-making and is silently standing down.
                 let twap = kind == ProgramKind::Twap;
-                self.db.set_setting("twap_only", if twap { "true" } else { "false" }).await?;
+                self.db.set_setting("twap_only", if kind.is_twap() { "true" } else { "false" }).await?;
+                if kind == ProgramKind::TwapSell {
+                    return Ok(format!(
+                        "program {id} on {asset} (slow sell) — every unit for sale, never below {}; \
+                         TWAP mode on: asks only, every other book stands down",
+                        dec_arg("limit_price").unwrap_or(SELL_FLOOR)
+                    ));
+                }
                 if twap {
                     return Ok(format!(
                         "program {id} on {asset} (twap) from {inventory} to {target} \
@@ -3679,6 +3893,60 @@ struct TakerClip {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// The bids a twap wants resting: all at the best bid, as a stack of orders.
+///
+/// The owner's rule (2026-10-07): keep buying at the bid until it fills, and
+/// bid more the longer it waits -- by adding orders, not replacing them. So:
+///
+/// * the touch is the plan's level-0 bid, and its size is one chunk;
+/// * every order of ours already at that price is kept as it stands, oldest
+///   first, since the oldest is nearest the front of the queue;
+/// * the stack is topped up with one new order whenever it is a chunk or more
+///   short of the schedule deficit, which grows while nothing fills;
+/// * once fills catch the schedule up, the newest orders past the deficit are
+///   left out, and so cancelled -- the ones with the worst queue place.
+///
+/// Every deeper rung is dropped: the job is to buy at the bid.
+fn twap_stack(
+    quotes: &[DesiredQuote],
+    live: &[crate::db::models::LiveOrder],
+    target_now: Decimal,
+    inventory: Decimal,
+    // Free quote cash. A top-up the purse cannot fund is skipped whole, so
+    // it is sized to what is there -- after a manual buy, that is less than
+    // the schedule says.
+    free_quote: Decimal,
+    amount_precision: u32,
+) -> Vec<DesiredQuote> {
+    let Some(touch) = quotes.iter().find(|q| q.side == Side::Buy && q.level == 0) else {
+        return quotes.to_vec();
+    };
+    let chunk = touch.amount;
+    let want = (target_now - inventory).max(chunk);
+
+    let mut resting: Vec<&crate::db::models::LiveOrder> =
+        live.iter().filter(|o| o.side == Side::Buy && o.price == touch.price).collect();
+    resting.sort_by_key(|o| o.placed_at);
+
+    let mut out: Vec<DesiredQuote> =
+        quotes.iter().filter(|q| q.side == Side::Sell).cloned().collect();
+    let mut stacked = Decimal::ZERO;
+    for (i, o) in resting.iter().enumerate() {
+        // The oldest is always kept. A newer one only while it does not
+        // overshoot the deficit by more than a chunk.
+        if stacked > Decimal::ZERO && stacked + o.remaining() > want + chunk {
+            break;
+        }
+        stacked += o.remaining();
+        out.push(DesiredQuote { amount: o.remaining(), level: i as i64, ..touch.clone() });
+    }
+    let short = num::floor_to((want - stacked).min(free_quote / touch.price), amount_precision);
+    if short >= chunk {
+        out.push(DesiredQuote { amount: short, level: resting.len() as i64, ..touch.clone() });
+    }
+    out
+}
+
 fn taker_clip(
     market: &Market,
     book: &OrderBook,
@@ -3691,7 +3959,11 @@ fn taker_clip(
     free_base: Decimal,
     our_participation: Decimal,
 ) -> Option<TakerClip> {
-    if !params.q.allow_taker || !program.kind.is_execution() || program.ends_at.is_none() {
+    if !params.enabled
+        || !params.q.allow_taker
+        || !program.kind.is_execution()
+        || program.ends_at.is_none()
+    {
         return None;
     }
     // No limit price, no crossing. "Spend it as fast as you can" with no
@@ -4078,6 +4350,64 @@ mod tests {
     use super::*;
     use crate::db::models::{LiveOrder, Position};
 
+    fn bid(price: Decimal, amount: Decimal, level: i64) -> DesiredQuote {
+        DesiredQuote {
+            side: Side::Buy, price, amount, level, bps: dec!(50),
+            recent_move: Decimal::ZERO, width_ticks: Decimal::ONE,
+        }
+    }
+
+    fn resting(id: i64, price: Decimal, amount: Decimal, filled: Decimal, placed_at: i64) -> LiveOrder {
+        LiveOrder {
+            client_id: format!("c{id}"), exchange_id: id, side: Side::Buy, price, amount,
+            filled, level: 0, placed_at,
+        }
+    }
+
+    /// The twap's bid grows by ADDING orders at the touch, never by resizing
+    /// one -- a resized order loses its place in the queue.
+    #[test]
+    fn a_twap_stacks_new_orders_instead_of_replacing() {
+        let plan = vec![bid(dec!(1.24), dec!(500), 0), bid(dec!(1.23), dec!(800), 1)];
+
+        // Nothing resting, on schedule: one chunk at the touch, no deeper rung.
+        let q = twap_stack(&plan, &[], dec!(100), dec!(0), dec!(100000), 4);
+        assert_eq!(q, vec![bid(dec!(1.24), dec!(500), 0)]);
+
+        // Behind by 3000 with 500 resting: the 500 stays exactly as it is, and
+        // one new order of 2500 goes on top. No cap on its size.
+        let live = [resting(1, dec!(1.24), dec!(500), dec!(0), 10)];
+        let q = twap_stack(&plan, &live, dec!(3000), dec!(0), dec!(100000), 4);
+        assert_eq!(q, vec![bid(dec!(1.24), dec!(500), 0), bid(dec!(1.24), dec!(2500), 1)]);
+
+        // Short by less than a chunk: no new order, so no churn every loop.
+        let q = twap_stack(&plan, &live, dec!(800), dec!(0), dec!(100000), 4);
+        assert_eq!(q, vec![bid(dec!(1.24), dec!(500), 0)]);
+
+        // Fills caught the schedule up: the oldest order is kept (it is at the
+        // front of the queue) and the newest is left out, so it is cancelled.
+        let live = [
+            resting(2, dec!(1.24), dec!(2500), dec!(0), 20),
+            resting(1, dec!(1.24), dec!(500), dec!(200), 10),
+        ];
+        let q = twap_stack(&plan, &live, dec!(1000), dec!(800), dec!(100000), 4);
+        assert_eq!(q, vec![bid(dec!(1.24), dec!(300), 0)]);
+
+        // A partly filled order is kept at what is left of it, not resized.
+        let q = twap_stack(&plan, &live, dec!(5000), dec!(0), dec!(100000), 4);
+        assert_eq!(
+            q,
+            vec![bid(dec!(1.24), dec!(300), 0), bid(dec!(1.24), dec!(2500), 1), bid(dec!(1.24), dec!(2200), 2)]
+        );
+
+        // Cash for only 1240 more: the top-up is sized to it, not skipped.
+        let q = twap_stack(&plan, &live, dec!(5000), dec!(0), dec!(1240), 4);
+        assert_eq!(
+            q,
+            vec![bid(dec!(1.24), dec!(300), 0), bid(dec!(1.24), dec!(2500), 1), bid(dec!(1.24), dec!(1000), 2)]
+        );
+    }
+
     fn market() -> Market {
         Market {
             id: "prlusdt".into(), name: "PRL/USDT".into(),
@@ -4391,6 +4721,15 @@ mod tests {
             taker_clip(&m, &b, &twap(None), &p, fv, dec!(2000), dec!(7000), dec!(70000), Decimal::ZERO, Decimal::ZERO)
                 .is_none(),
             "a program with no ceiling must not cross"
+        );
+
+        // Paused: no crossing.
+        let mut paused = p.clone();
+        paused.enabled = false;
+        assert!(
+            taker_clip(&m, &b, &prog, &paused, fv, dec!(2000), dec!(7000), dec!(70000), Decimal::ZERO, Decimal::ZERO)
+                .is_none(),
+            "a paused bot must not cross"
         );
 
         // allow_taker off: no crossing.

@@ -158,7 +158,38 @@ impl Telegram {
     ///
     /// A stale keyboard on an old message is harmless: tapping re-sends an
     /// idempotent command, and the reply carries a fresh keyboard.
+    #[cfg(test)]
     fn keyboard(paused: bool) -> serde_json::Value {
+        Self::keyboard_with(paused, None)
+    }
+
+    /// The keyboard, plus a TWAP row while a twap runs: hold or resume it,
+    /// see its progress, and switch the 5% spike breather on or off.
+    /// `twap` is `(held, spike_on)`.
+    fn keyboard_with(paused: bool, twap: Option<(bool, bool)>) -> serde_json::Value {
+        let mut kb = Self::base_keyboard(paused);
+        if let Some((held, spike_on)) = twap {
+            let hold = if held {
+                serde_json::json!({"text": "▶️ Resume TWAP", "callback_data": "twapgo"})
+            } else {
+                serde_json::json!({"text": "✋ Hold TWAP", "callback_data": "twaphold"})
+            };
+            let spike = if spike_on {
+                serde_json::json!({"text": "🛡 Spike guard: on", "callback_data": "spike off"})
+            } else {
+                serde_json::json!({"text": "🛡 Spike guard: off", "callback_data": "spike 5"})
+            };
+            let rows = kb["inline_keyboard"].as_array_mut().expect("rows");
+            rows.insert(0, serde_json::json!([
+                hold,
+                {"text": "⏱ TWAP progress", "callback_data": "progress"}
+            ]));
+            rows.insert(1, serde_json::json!([spike]));
+        }
+        kb
+    }
+
+    fn base_keyboard(paused: bool) -> serde_json::Value {
         let toggle = if paused {
             serde_json::json!({"text": "▶️ Resume", "callback_data": "resume"})
         } else {
@@ -191,19 +222,29 @@ impl Telegram {
         self.db.get_setting("enabled").await.ok().flatten().as_deref() == Some("false")
     }
 
+    /// `(held, spike_on)` while a twap runs, for the keyboard's TWAP row.
+    async fn twap_keys(&self) -> Option<(bool, bool)> {
+        if !self.db.setting_bool("twap_only", false).await {
+            return None;
+        }
+        let held = self.db.setting_bool("twap_hold", false).await;
+        let spike_on = self.db.setting_decimal("twap_spike_pct", dec!(5)).await > Decimal::ZERO;
+        Some((held, spike_on))
+    }
+
     async fn send_to(&self, chat_id: i64, text: &str) -> Result<()> {
         // Telegram rejects anything over 4096 characters, so long output is
         // split rather than cut. Cutting it mid-message used to sever the
         // closing </pre>, which Telegram then rejected outright -- so the
         // longest and most useful replies were the ones that silently vanished.
-        let paused = self.is_paused().await;
+        let kb = Self::keyboard_with(self.is_paused().await, self.twap_keys().await);
         for chunk in split_for_telegram(text) {
-            self.send_one(chat_id, &chunk, paused).await?;
+            self.send_one(chat_id, &chunk, &kb).await?;
         }
         Ok(())
     }
 
-    async fn send_one(&self, chat_id: i64, body: &str, paused: bool) -> Result<()> {
+    async fn send_one(&self, chat_id: i64, body: &str, kb: &serde_json::Value) -> Result<()> {
         let resp = self
             .http
             .post(format!("{API}/bot{}/sendMessage", self.token))
@@ -212,7 +253,7 @@ impl Telegram {
                 "text": body,
                 "parse_mode": "HTML",
                 "disable_web_page_preview": true,
-                "reply_markup": Self::keyboard(paused),
+                "reply_markup": kb,
             }))
             .send()
             .await
@@ -522,8 +563,51 @@ impl Telegram {
             // "flatten", which on a mostly-PRL account is the opposite trade.
             "flat" | "flatten" => self.program(ProgramKind::Flatten, &args, false).await,
 
+            // Hold a running twap, or let it go on. Its schedule keeps running.
+            "twaphold" => self.queue(
+                "set",
+                serde_json::json!({ "key": "twap_hold", "value": "true" }),
+                "✋ TWAP on hold — its bids are pulled. The schedule keeps running, \
+                 so it catches up when you resume.",
+            ).await,
+            "twapgo" => self.queue(
+                "set",
+                serde_json::json!({ "key": "twap_hold", "value": "false" }),
+                "▶️ TWAP resumed.",
+            ).await,
+            // The breather: `spike 5` holds the twap while price is over 5% above
+            // the hour's low; `spike off` buys through any move.
+            "spike" => {
+                let v = match args.first().map(|a| a.to_lowercase()) {
+                    Some(a) if a == "off" || a == "0" => Decimal::ZERO,
+                    Some(a) => a.trim_end_matches('%').parse::<Decimal>()
+                        .ok()
+                        .filter(|v| *v > Decimal::ZERO)
+                        .ok_or_else(|| anyhow::anyhow!("usage: <code>spike 5</code> or <code>spike off</code>"))?,
+                    None => dec!(5),
+                };
+                let msg = if v.is_zero() {
+                    "🛡 Spike guard off — the TWAP buys through any move.".to_string()
+                } else {
+                    format!("🛡 Spike guard on — the TWAP takes a breather while price is over {v}% above the last hour's low.")
+                };
+                self.queue("set", serde_json::json!({ "key": "twap_spike_pct", "value": v.to_string() }), &msg).await
+            }
+            "progress" => {
+                let base = self.base_ccy().await;
+                let markets = self.cfg.market_list();
+                Ok(match reporting::sell_progress(&self.db, &base, &markets).await? {
+                    Some(s) => s,
+                    None => reporting::twap_progress(&self.db, &base, &markets)
+                        .await?
+                        .unwrap_or_else(|| "No TWAP is running.".into()),
+                })
+            }
+
             // TWAP the lot in: "twap 6h", "twap over 6h max 1.60".
             "twap" | "ripitin" => self.twap(&args).await,
+            // Sell it all, slowly: "twapsell", "twapsell min 1.30".
+            "twapsell" | "sellslow" => self.twapsell(&args).await,
 
             // The steady state: hold a share of value in PRL and rebalance.
             "balance" | "balanced" | "rebalance" => self.balance(&args).await,
@@ -586,6 +670,46 @@ impl Telegram {
         } else {
             format!("<pre>{}</pre>", esc(&reporting::render(&r)))
         })
+    }
+
+    /// `twapsell [min PRICE]` — sell every unit of the base asset, slowly, as a
+    /// share of the day's volume, asks only. See `strategy::sell`.
+    async fn twapsell(&self, args: &[String]) -> Result<String> {
+        let mut floor: Option<Decimal> = None;
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].to_lowercase().as_str() {
+                "min" | "floor" | "limit" | "at" => {
+                    floor = args.get(i + 1).and_then(|v| v.parse().ok());
+                    i += 2;
+                }
+                v => {
+                    if let Ok(p) = v.parse() {
+                        floor = Some(p);
+                    }
+                    i += 1;
+                }
+            }
+        }
+        let floor = floor.unwrap_or(dec!(1.30));
+        let asset = self.base_ccy().await;
+        let day = self.db.setting_decimal("sell_day_pct", dec!(5)).await;
+        self.queue(
+            "program",
+            serde_json::json!({
+                "kind": "twapsell",
+                "asset": asset,
+                "limit_price": floor.to_string(),
+                "note": "twapsell: every unit for sale, slowly, via telegram",
+            }),
+            &format!(
+                "✅ queued: slow sell of every {a} on the account, never below {floor}.\n\n\
+                 Small asks joined to the lowest existing ask levels, never a new price, \
+                 never crossing. Under {day}% of the day's volume. Every other book stands down.",
+                a = asset.to_uppercase(),
+            ),
+        )
+        .await
     }
 
     /// `twap [over] 6h [max PRICE]` — work every spendable unit into the base
@@ -897,10 +1021,17 @@ impl Telegram {
     }
 
     /// Push a status message on a fixed cadence.
+    ///
+    /// While a twap runs, every 15 minutes it sends the twap's progress
+    /// instead: cash left, bought, average price, resting orders and fills.
+    /// The owner asked for that cadence on 2026-10-07; the earnings screen
+    /// says little while the bot is only buying.
     pub async fn hourly_loop(self: Arc<Self>, shutdown: Arc<AtomicBool>, every: Duration) {
-        let mut tick = tokio::time::interval(every);
+        const TWAP_EVERY: Duration = Duration::from_secs(900);
+        let mut tick = tokio::time::interval(every.min(TWAP_EVERY));
         // The first tick fires immediately; skip it so a restart does not spam.
         tick.tick().await;
+        let mut last_earnings = tokio::time::Instant::now();
         while !shutdown.load(Ordering::Relaxed) {
             tick.tick().await;
             if shutdown.load(Ordering::Relaxed) {
@@ -909,6 +1040,30 @@ impl Telegram {
             if self.chat_id().await.is_none() {
                 continue;
             }
+            let base = self.base_ccy().await;
+            // A slow sell runs for weeks: its progress replaces the hourly
+            // earnings, at the hourly cadence, not every 15 minutes.
+            let sell = reporting::sell_progress(&self.db, &base, &self.cfg.market_list()).await;
+            if let Ok(Some(body)) = sell {
+                if last_earnings.elapsed() + Duration::from_secs(5) >= every {
+                    last_earnings = tokio::time::Instant::now();
+                    let _ = self.send(&body).await;
+                }
+                continue;
+            }
+            match reporting::twap_progress(&self.db, &base, &self.cfg.market_list()).await {
+                Ok(Some(body)) => {
+                    let _ = self.send(&body).await;
+                    continue;
+                }
+                Ok(None) => {}
+                Err(e) => warn!(error = %format!("{e:#}"), "could not build the twap progress"),
+            }
+            // A few seconds of slack: the ticks land on the interval, not after it.
+            if last_earnings.elapsed() + Duration::from_secs(5) < every {
+                continue;
+            }
+            last_earnings = tokio::time::Instant::now();
             let built = self.earnings().await;
             let body = match built {
                 Ok(s) => s,
@@ -950,7 +1105,14 @@ fn help_text(market: &str) -> String {
          <b>Put everything in</b> — no quantity, no market making\n\
          <code>twap 6h</code> — every spendable unit into {base} over 6 hours, <b>bids only</b>\n\
          <code>twap 6h max 1.60</code> — …never paying above 1.60\n\
-         New capital that lands mid-run is worked in too, over a fresh window of its own.\n\n\
+         New capital that lands mid-run is worked in too, over a fresh window of its own.\n\
+         <code>twaphold</code> / <code>twapgo</code> — hold the TWAP, or let it go on\n\
+         <code>spike 5</code> — pause buying while price is 5% over the hour's low; <code>spike off</code>\n\
+         <code>progress</code> — USDT left, bought, average price, orders\n\n\
+         <b>Sell it all, slowly</b> — asks only, no deadline\n\
+         <code>twapsell</code> — every {base} for sale, small asks under 5% of the day's volume, never below 1.30\n\
+         <code>twapsell min 1.35</code> — …never below 1.35\n\
+         <code>set sell_day_pct 8</code> — change the pace; <code>twaphold</code> holds it too\n\n\
          <b>Set a stance</b> — an end state, not an amount to trade\n\
          <code>balance 50</code> — hold 50% of <i>value</i> in {base}, forever\n\
          <code>balance 50 over 24h</code> — …easing in over a day\n\
@@ -1026,9 +1188,10 @@ mod tests {
         let known = [
             "status", "details", "report", "edge", "orders", "pause", "resume", "panic",
             "help", "settings", "set", "buy", "sell", "hold", "flat", "twap", "balance",
+            "twaphold", "twapgo", "spike", "progress",
         ];
-        for paused in [false, true] {
-            let kb = Telegram::keyboard(paused);
+        for (paused, twap) in [(false, None), (true, None), (false, Some((false, true))), (true, Some((true, false)))] {
+            let kb = Telegram::keyboard_with(paused, twap);
             let rows = kb["inline_keyboard"].as_array().expect("rows");
             let mut count = 0;
             for row in rows {

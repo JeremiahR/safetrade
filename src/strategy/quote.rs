@@ -93,6 +93,11 @@ pub enum Halt {
     NoReference,
     /// TWAP mode, and this book's asset is not the one being worked.
     TwapOnly,
+    /// A twap taking a breather: price rose more than `twap_spike_pct` over
+    /// the last hour, measured from the hour's low.
+    TwapSpike { rise: Decimal },
+    /// A twap the owner put on hold by hand (`twap_hold`).
+    TwapHeld,
 }
 
 impl Halt {
@@ -114,6 +119,11 @@ impl Halt {
             Halt::TwapOnly => {
                 "TWAP mode: this book's asset is not the one being worked".into()
             }
+            Halt::TwapSpike { rise } => format!(
+                "TWAP breather: price is up {:.1}% on the hour's low",
+                rise * dec!(100)
+            ),
+            Halt::TwapHeld => "TWAP on hold (twap_hold)".into(),
             Halt::NoReference => {
                 "no fair value from the deeper book this loop — not quoting this one off its own residue"
                     .into()
@@ -131,7 +141,7 @@ pub struct Decision {
 }
 
 impl Decision {
-    fn halted(h: Halt, target: Decimal) -> Decision {
+    pub fn halted(h: Halt, target: Decimal) -> Decision {
         Decision { quotes: vec![], halt: Some(h), fair_value: None, target_inventory: target }
     }
 }
@@ -254,7 +264,7 @@ pub fn plan(input: &QuoteInput) -> Decision {
     // said that this book is not to trade. The cycle's valve and the recycle
     // crossing are gated on the same flag at the caller, so the money stays
     // where the TWAP can spend it.
-    if params.q.twap_only && !program.kind.is_buy_only() {
+    if params.q.twap_only && !program.kind.is_twap() {
         return Decision::halted(Halt::TwapOnly, target);
     }
     // Before the book is even looked at: a book that is priced off a deeper
@@ -656,9 +666,15 @@ pub fn plan(input: &QuoteInput) -> Decision {
         // left a hole between the floor and the next surviving rung, so the
         // floor quietly became whatever price happened to land above it), and
         // the arm a rung is a bet on is decided by where it finally rests.
+        // A twap's first bid joins the best bid. Priced off fair value it
+        // floors a tick under the touch on a one-tick book, and sits behind
+        // the whole queue: on 2026-10-07 a 24h twap rested at 1.24 under a
+        // 1.25 bid and filled nothing.
+        let want = num::floor_to(reservation - half_spread - step, market.price_precision);
+        let want = if level == 0 && program.kind == crate::db::models::ProgramKind::Twap { want.max(best_bid) } else { want };
         if let Some(price) = clamp_price(
             Side::Buy,
-            num::floor_to(reservation - half_spread - step, market.price_precision),
+            want,
             best_bid,
             best_ask,
             tick,
@@ -906,7 +922,7 @@ fn clamp_price(
 ///
 /// Deterministic on purpose: the same seed must give the same ladder, so the
 /// reconciler sees no change and leaves the orders resting.
-fn jitter_unit(seed: u64) -> Decimal {
+pub(crate) fn jitter_unit(seed: u64) -> Decimal {
     // SplitMix64. Cheap, and good enough to stop a ladder looking machine-made.
     let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -3482,6 +3498,24 @@ mod tests {
         off.q.twap_only = false;
         let neutral = program(crate::db::models::ProgramKind::Neutral, dec!(0), dec!(10000), 0);
         assert!(plan(&input(&m, &b, &off, &neutral, dec!(5000), 0)).halt.is_none());
+    }
+
+    /// A twap on schedule still bids AT the best bid, not a tick under it.
+    #[test]
+    fn a_twap_joins_the_best_bid() {
+        // The live book on 2026-10-07: one tick wide, the ask a little heavier,
+        // so fair value sits a hair under the bid.
+        let m = market();
+        let b = OrderBook {
+            bids: vec![(dec!(1.25), dec!(1515)), (dec!(1.24), dec!(5000))],
+            asks: vec![(dec!(1.26), dec!(1777)), (dec!(1.27), dec!(5000))],
+        };
+        let p = params();
+        let twap = program(crate::db::models::ProgramKind::Twap, dec!(5000), dec!(100000), 24 * 3_600_000);
+        let d = plan(&input(&m, &b, &p, &twap, dec!(5000), 0));
+        let best = b.best_bid().map(|(px, _)| px).unwrap();
+        let top = d.quotes.iter().filter(|q| q.side == Side::Buy).map(|q| q.price).max();
+        assert_eq!(top, Some(best), "{:?}", d.quotes);
     }
 
     /// A twap is execution, so the arms do not gate it: getting the size in is

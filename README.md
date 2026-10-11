@@ -30,6 +30,7 @@ the patience.
 | `balanced`   | **a share of portfolio value**, live    | constant-mix rebalance |
 | `learned`    | `balanced`, with the share **set by the arms** hourly | the split follows the yield |
 | `twap`       | **everything the cash can buy**, live   | buy-only TWAP, nothing else quoting |
+| `twapsell`   | **zero**: every unit is for sale, live  | sell-only TWAP, nothing else quoting |
 
 Because all of them are just a number, there is one quoting path and no
 separate execution engine. Switching stance at runtime is changing the target,
@@ -188,6 +189,9 @@ audit trail of who asked for what lives in the same file as the trading history.
 # Put the whole account into PRL over six hours, bids only
 safetrade ctl twap --over 6h
 
+# Sell every PRL on the account, slowly, asks only, never below 1.30
+safetrade ctl twapsell --floor 1.30
+
 # Accumulate 20,000 PRL over two days, never paying above 1.02
 safetrade ctl program accumulate 20000 --over 2d --limit-price 1.02
 
@@ -253,6 +257,7 @@ It posts a status message every hour (`telegram_status_secs`) and answers:
 | `sell 5000 over 12h min 1.10` | offload 5,000, never below 1.10 |
 | `twap 6h` | put every spendable unit into PRL over six hours, bids only |
 | `twap 6h max 1.60` | …never paying above 1.60 |
+| `twapsell min 1.30` | sell every PRL slowly, asks only, never below 1.30 |
 | `balance 50` | hold 50% of value in PRL, rebalancing forever |
 | `balance 50 over 24h` | …easing into it over a day |
 | `hold 20000` | market-make around an absolute quantity |
@@ -507,6 +512,30 @@ safetrade ctl program accumulate 12000 --over 5h --limit-price 1.50
 Without that flag "defunded" still meant the exchange minimum on every rung, on
 both sides, cancelled and replaced for ever — 212 bids and 282 asks in two hours,
 and the USDT tied up was the USDT `prlusdc`'s bids were starved of.
+
+## Slow sell: take it all out, without being seen
+
+```sh
+safetrade ctl twapsell --floor 1.30       # or `twapsell min 1.30` on Telegram
+```
+
+The mirror of TWAP mode below. Every unit of the base asset is for sale, and
+anything deposited while it runs joins the sale, so topping up is just sending
+coins. It works the ask side like a small iceberg (`src/strategy/sell.rs`):
+
+- **Join, never set.** Orders rest only at prices where strangers already have
+  asks, at or above the floor. No new price levels, no undercutting, no crossing.
+- **Small beside what is there.** Each order is a capped share of the size
+  already resting at its price, lowest levels funded first.
+- **Capped by the tape.** New orders go out only while what we sold is under a
+  share of the last hour's and the last day's volume (`sell_hour_pct`,
+  `sell_day_pct`).
+- **Reads the flow.** When sellers are hitting the bids it adds nothing; when
+  buyers are lifting the asks it shows more.
+- **Keeps its queue.** Resting asks are not moved for drift, and are left
+  resting through a restart.
+
+Every other book stands down while it runs. `ctl set` lists the `sell_*` knobs.
 
 ## TWAP mode: put it all in, and nothing else
 

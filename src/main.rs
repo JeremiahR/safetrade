@@ -155,6 +155,17 @@ enum Ctl {
         #[arg(long)]
         note: Option<String>,
     },
+    /// Sell every unit of the base asset, slowly: asks only, a share of the
+    /// day's volume, never below a floor, nothing else quoting. Deposits are
+    /// simply more for sale. Pace via `ctl set sell_day_pct` and friends.
+    Twapsell {
+        /// Never sell below this.
+        #[arg(long, default_value = "1.30")]
+        floor: Decimal,
+        /// Which asset to sell. Defaults to the primary market's base.
+        #[arg(long)]
+        asset: Option<String>,
+    },
     /// Start an execution program.
     Program {
         /// neutral | accumulate | distribute | flatten
@@ -253,7 +264,7 @@ async fn main() -> Result<()> {
             }
 
             let shutdown = Arc::new(AtomicBool::new(false));
-            spawn_signal_handler(shutdown.clone(), api.clone(), cfg.market_list(), dry_run);
+            spawn_signal_handler(shutdown.clone(), api.clone(), db.clone(), cfg.market_list(), dry_run);
             SHUTDOWN.store(false, Ordering::Relaxed);
 
             // The Telegram front end writes into the same command queue the CLI
@@ -426,6 +437,7 @@ fn shutdown_requested() -> bool {
 fn spawn_signal_handler(
     shutdown: Arc<AtomicBool>,
     api: Arc<Client>,
+    db: Db,
     markets: Vec<String>,
     dry_run: bool,
 ) {
@@ -445,22 +457,24 @@ fn spawn_signal_handler(
         // limiter is backing off, and twice that has outrun the guard below and
         // exited with quotes still live on the book. Cancelling is idempotent,
         // so the engine doing it again on its way out costs nothing.
+        //
+        // Our own orders only, one at a time. The exchange's cancel-all took
+        // the owner's hand-placed orders down with every restart.
         if !dry_run {
             for m in &markets {
-                match api.cancel_all(m).await {
-                    Ok(o) => tracing::info!(market = %m, count = o.len(), "cancelled on signal"),
-                    Err(e) => {
-                        tracing::warn!(
-                            market = %m, error = %format!("{e:#}"),
-                            "bulk cancel failed; cancelling individually"
-                        );
-                        if let Ok(open) = api.open_orders(m).await {
-                            for o in open {
-                                let _ = api.cancel(o.id).await;
-                            }
-                        }
+                if db.keeps_orders_on_restart(m).await {
+                    tracing::info!(market = %m, "slow sell: leaving our orders resting through the restart");
+                    continue;
+                }
+                let ours = db.live_orders(m).await.unwrap_or_default();
+                let mut n = 0;
+                for o in &ours {
+                    if api.cancel(o.exchange_id).await.is_ok() {
+                        db.mark_cancelled(o.exchange_id).await.ok();
+                        n += 1;
                     }
                 }
+                tracing::info!(market = %m, count = n, of = ours.len(), "cancelled ours on signal");
             }
         }
 
@@ -632,6 +646,27 @@ async fn ctl(db: &Db, cfg: &Config, c: Ctl) -> Result<()> {
                 limit_price.map(|p| format!(", never above {p}")).unwrap_or_default()
             );
             println!("  bids only; every book that is not working this asset stands down");
+            Ok(())
+        }
+
+        Ctl::Twapsell { floor, asset } => {
+            let asset = match asset {
+                Some(a) => a.to_lowercase(),
+                None => db.program_key(&cfg.market).await.to_lowercase(),
+            };
+            queue(
+                db,
+                "program",
+                serde_json::json!({
+                    "kind": "twapsell",
+                    "asset": asset,
+                    "limit_price": floor.to_string(),
+                    "note": format!("twapsell: every {} for sale, slowly", asset.to_uppercase()),
+                }),
+            )
+            .await?;
+            println!("  queued: slow sell of every {} on the account, never below {floor}", asset.to_uppercase());
+            println!("  asks only; every book that is not working this asset stands down");
             Ok(())
         }
 

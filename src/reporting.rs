@@ -2946,6 +2946,253 @@ pub fn render_earnings(r: &Report) -> String {
     o
 }
 
+/// How a running twap is doing, for the 15-minute Telegram push: cash left,
+/// what we bought and at what average, what rests now, and the last fills.
+///
+/// `None` when the asset has no active twap. Counts every twap in the current
+/// run, not just the active one: a deposit restarts the twap as a new program,
+/// and "bought" should not drop to zero when it does.
+pub async fn twap_progress(db: &Db, base: &str, markets: &[String]) -> Result<Option<String>> {
+    let Some(p) = db.active_program(base).await? else { return Ok(None) };
+    if p.kind != ProgramKind::Twap {
+        return Ok(None);
+    }
+
+    // The unbroken run of twaps on this asset, newest first.
+    let recent: Vec<(i64, String)> =
+        sqlx::query_as("SELECT id, kind FROM programs WHERE market = ? ORDER BY id DESC LIMIT 50")
+            .bind(base)
+            .fetch_all(db.pool())
+            .await?;
+    let first = recent
+        .iter()
+        .take_while(|(_, k)| k == "twap")
+        .last()
+        .map(|(id, _)| *id)
+        .unwrap_or(p.id);
+
+    // The books that trade this asset, as the engine recorded them.
+    let mut books = Vec::new();
+    for m in markets {
+        if db.get_setting(&format!("base_unit:{m}")).await?.as_deref() == Some(base) {
+            books.push(m.clone());
+        }
+    }
+
+    let fills: Vec<(i64, String, String, String, String, String)> = sqlx::query_as(
+        "SELECT created_at, market, side, price, amount, total FROM fills
+         WHERE program_id IN (SELECT id FROM programs WHERE market = ? AND kind = 'twap' AND id >= ?)
+         ORDER BY created_at DESC",
+    )
+    .bind(base)
+    .bind(first)
+    .fetch_all(db.pool())
+    .await?;
+    let (mut qty, mut cost) = (Decimal::ZERO, Decimal::ZERO);
+    for (_, _, side, _, amount, total) in &fills {
+        if side == "buy" {
+            qty += num::parse(amount);
+            cost += num::parse(total);
+        }
+    }
+
+    let usdt = held(db, "usdt").await;
+    let usdc = held(db, "usdc").await;
+    let b = base.to_uppercase();
+
+    let mut o = format!("⏱ <b>TWAP #{} — {b}</b>\n", p.id);
+    o.push_str(&format!("USDT left: <b>{}</b>", usdt.round_dp(2)));
+    if usdc >= dec!(1) {
+        o.push_str(&format!("  (USDC {})", usdc.round_dp(2)));
+    }
+    o.push('\n');
+    o.push_str(&format!("Bought: <b>{} {b}</b> for {}\n", qty.round_dp(2), cost.round_dp(2)));
+    if qty > Decimal::ZERO {
+        o.push_str(&format!("Avg price: <b>{}</b>\n", (cost / qty).round_dp(4)));
+    }
+    let left = p.ends_at.map(|e| dur(((e - crate::db::now_ms()) / 1000).max(0)));
+    o.push_str(&format!(
+        "Target {} {b} · {} left · max {}\n",
+        p.target_qty.round_dp(0),
+        left.unwrap_or_else(|| "no deadline".into()),
+        p.limit_price.map(|v| v.to_string()).unwrap_or_else(|| "none (bids only)".into()),
+    ));
+
+    let mut resting = Vec::new();
+    for m in &books {
+        for r in db.live_orders(m).await? {
+            resting.push((m.clone(), r));
+        }
+    }
+    o.push_str(&format!("\n<b>Outstanding orders ({})</b>\n<pre>", resting.len()));
+    if resting.is_empty() {
+        o.push_str("none\n");
+    }
+    for (m, r) in &resting {
+        o.push_str(&format!(
+            "{:<8} {:<4} {:>8} × {:>9}  {}\n",
+            m, r.side.as_str().to_uppercase(), r.price.round_dp(4),
+            (r.amount - r.filled).max(Decimal::ZERO).round_dp(2), age(r.placed_at)
+        ));
+    }
+    o.push_str("</pre>\n");
+
+    o.push_str("<b>Recent fills</b>\n<pre>");
+    if fills.is_empty() {
+        o.push_str("none yet\n");
+    }
+    for (t, m, side, price, amount, _) in fills.iter().take(8) {
+        o.push_str(&format!(
+            "{:<8} {:<4} {:>8} × {:>9}  {}\n",
+            m, side.to_uppercase(), num::parse(price).round_dp(4),
+            num::parse(amount).round_dp(2), age(*t)
+        ));
+    }
+    o.push_str("</pre>");
+    Ok(Some(o))
+}
+
+/// How the slow sell is doing, for `progress` and the hourly push: what is
+/// left, what sold and at what average against the market's, our share of
+/// the day's volume, and what rests now.
+///
+/// `None` when the asset has no slow sell running. Counts every sell fill on
+/// the asset's books since the run started, hand-placed ones included.
+pub async fn sell_progress(db: &Db, base: &str, markets: &[String]) -> Result<Option<String>> {
+    let Some(p) = db.active_program(base).await? else { return Ok(None) };
+    if p.kind != ProgramKind::TwapSell {
+        return Ok(None);
+    }
+    let mut books = Vec::new();
+    for m in markets {
+        if db.get_setting(&format!("base_unit:{m}")).await?.as_deref() == Some(base) {
+            books.push(m.clone());
+        }
+    }
+    let now = crate::db::now_ms();
+    let day_ago = now - 86_400_000;
+
+    let (mut qty, mut proceeds, mut day_qty) = (Decimal::ZERO, Decimal::ZERO, Decimal::ZERO);
+    let (mut mkt_qty, mut mkt_value, mut day_vol) = (Decimal::ZERO, Decimal::ZERO, Decimal::ZERO);
+    let mut fills: Vec<(i64, String, String, String)> = Vec::new();
+    for m in &books {
+        let rows: Vec<(i64, String, String, String)> = sqlx::query_as(
+            "SELECT created_at, price, amount, total FROM fills
+             WHERE market = ? AND side = 'sell' AND created_at >= ? ORDER BY created_at DESC",
+        )
+        .bind(m)
+        .bind(p.started_at.min(day_ago))
+        .fetch_all(db.pool())
+        .await?;
+        for (t, price, amount, total) in rows {
+            let a = num::parse(&amount);
+            if t >= p.started_at {
+                qty += a;
+                proceeds += num::parse(&total);
+                fills.push((t, m.clone(), price, amount));
+            }
+            if t >= day_ago {
+                day_qty += a;
+            }
+        }
+        let tape: Vec<(i64, String, String)> =
+            sqlx::query_as("SELECT ts, price, amount FROM tape WHERE market = ? AND ts >= ?")
+                .bind(m)
+                .bind(p.started_at.min(day_ago))
+                .fetch_all(db.pool())
+                .await?;
+        for (t, price, amount) in tape {
+            let a = num::parse(&amount);
+            if t >= p.started_at {
+                mkt_qty += a;
+                mkt_value += a * num::parse(&price);
+            }
+            if t >= day_ago {
+                day_vol += a;
+            }
+        }
+    }
+    fills.sort_by(|a, b| b.0.cmp(&a.0));
+
+    let b = base.to_uppercase();
+    let mut o = format!("💸 <b>Slow sell #{} — {b}</b>\n", p.id);
+    o.push_str(&format!("{b} left: <b>{}</b>\n", held(db, base).await.round_dp(0)));
+    o.push_str(&format!("Sold: <b>{} {b}</b> for {}", qty.round_dp(0), proceeds.round_dp(2)));
+    o.push_str(&format!(" · running {}\n", dur(((now - p.started_at) / 1000).max(0))));
+    if qty > Decimal::ZERO {
+        let ours = proceeds / qty;
+        o.push_str(&format!("Avg price: <b>{}</b>", ours.round_dp(4)));
+        if mkt_qty > Decimal::ZERO {
+            let theirs = mkt_value / mkt_qty;
+            o.push_str(&format!(
+                " vs market {} (<b>{:+.2}%</b>)",
+                theirs.round_dp(4),
+                (ours - theirs) / theirs * dec!(100)
+            ));
+        }
+        o.push('\n');
+    }
+    if day_vol > Decimal::ZERO {
+        o.push_str(&format!(
+            "Last 24h: {} of {} traded (<b>{:.2}%</b>)\n",
+            day_qty.round_dp(0),
+            day_vol.round_dp(0),
+            day_qty / day_vol * dec!(100)
+        ));
+    }
+    // How long what is here lasts at the cap, so the owner tops up about a
+    // day at a time and never has much more than that on the exchange.
+    let day_pct = db.setting_decimal("sell_day_pct", dec!(5)).await;
+    let left = held(db, base).await;
+    let pace = day_pct / dec!(100) * day_vol;
+    o.push_str(&format!(
+        "Cap {day_pct}% of 24h volume (≈{} {b}/day) · never below {}{}\n",
+        pace.round_dp(0),
+        p.limit_price.map(|v| v.to_string()).unwrap_or_else(|| "1.30".into()),
+        if db.setting_bool("twap_hold", false).await { " · <b>ON HOLD</b>" } else { "" },
+    ));
+    if pace > Decimal::ZERO {
+        let hours = left / pace * dec!(24);
+        o.push_str(&format!("{b} here lasts ≈{}h at the cap", hours.round_dp(0)));
+        if hours < dec!(12) {
+            o.push_str(&format!(" — <b>top up ≈{} {b}</b>", ((pace - left).max(Decimal::ZERO) / dec!(1000)).round() * dec!(1000)));
+        }
+        o.push('\n');
+    }
+
+    let mut resting = Vec::new();
+    for m in &books {
+        for r in db.live_orders(m).await? {
+            resting.push((m.clone(), r));
+        }
+    }
+    resting.sort_by(|a, b| a.1.price.cmp(&b.1.price));
+    let total: Decimal = resting.iter().map(|(_, r)| (r.amount - r.filled).max(Decimal::ZERO)).sum();
+    o.push_str(&format!("\n<b>Asks resting ({}, {} {b})</b>\n<pre>", resting.len(), total.round_dp(0)));
+    if resting.is_empty() {
+        o.push_str("none\n");
+    }
+    for (m, r) in &resting {
+        o.push_str(&format!(
+            "{:<8} {:<4} {:>8} × {:>9}  {}\n",
+            m, r.side.as_str().to_uppercase(), r.price.round_dp(4),
+            (r.amount - r.filled).max(Decimal::ZERO).round_dp(0), age(r.placed_at)
+        ));
+    }
+    o.push_str("</pre>\n<b>Recent sells</b>\n<pre>");
+    if fills.is_empty() {
+        o.push_str("none yet\n");
+    }
+    for (t, m, price, amount) in fills.iter().take(8) {
+        o.push_str(&format!(
+            "{:<8} {:>8} × {:>9}  {}\n",
+            m, num::parse(price).round_dp(4), num::parse(amount).round_dp(0), age(*t)
+        ));
+    }
+    o.push_str("</pre>");
+    Ok(Some(o))
+}
+
 pub fn render_compact(r: &Report) -> String {
     let mut o = String::new();
     let mark = r.mark.unwrap_or_default();

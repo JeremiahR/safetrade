@@ -57,6 +57,15 @@ pub enum ProgramKind {
     /// the glide from the current inventory over two evidence half-lives.
     /// Between those hours it is exactly a balanced program.
     Learned,
+    /// A slow sell of every unit of the base asset, paced by the market.
+    ///
+    /// No target and no deadline: every coin on the account is for sale, and
+    /// a deposit is simply more of it. The pace is a share of the book's own
+    /// 24h volume (`sell_rate_pct`, more above `sell_fast_price`), rested as
+    /// a ladder of asks from the touch up into where the spikes reach. It
+    /// never crosses and never undercuts the best ask, and never sells below
+    /// `limit_price`. See `strategy::sell`.
+    TwapSell,
 }
 
 impl ProgramKind {
@@ -69,6 +78,7 @@ impl ProgramKind {
             ProgramKind::Twap => "twap",
             ProgramKind::Balanced => "balanced",
             ProgramKind::Learned => "learned",
+            ProgramKind::TwapSell => "twapsell",
         }
     }
 
@@ -81,6 +91,7 @@ impl ProgramKind {
             "twap" | "ripitin" | "allin" => ProgramKind::Twap,
             "balanced" | "balance" | "rebalance" | "5050" => ProgramKind::Balanced,
             "learned" | "learn" | "auto" => ProgramKind::Learned,
+            "twapsell" | "sellslow" => ProgramKind::TwapSell,
             _ => return None,
         })
     }
@@ -125,7 +136,14 @@ impl ProgramKind {
                 | ProgramKind::Distribute
                 | ProgramKind::Flatten
                 | ProgramKind::Twap
+                | ProgramKind::TwapSell
         )
+    }
+
+    /// Whether this is one of the two twap programs, the ones TWAP mode
+    /// (`Quoting::twap_only`) lets quote while every other book stands down.
+    pub fn is_twap(&self) -> bool {
+        matches!(self, ProgramKind::Twap | ProgramKind::TwapSell)
     }
 }
 
@@ -223,6 +241,10 @@ impl Program {
     pub fn target_at(&self, now: i64, pf: Portfolio) -> Decimal {
         match self.kind {
             ProgramKind::Neutral | ProgramKind::Flatten => self.target_qty,
+
+            // Paced by the tape, not by inventory: there is no position to
+            // steer toward, so the target is wherever inventory already is.
+            ProgramKind::TwapSell => pf.base_qty,
 
             ProgramKind::Accumulate | ProgramKind::Distribute => {
                 self.ramp(now, self.target_qty)

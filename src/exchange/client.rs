@@ -386,13 +386,6 @@ impl Client {
         .await
     }
 
-    /// Cancel every resting order on `market`. The safety net used on shutdown
-    /// and by `ctl panic`.
-    pub async fn cancel_all(&self, market: &str) -> Result<Vec<Order>> {
-        let body = serde_json::json!({ "market": market });
-        self.request(Method::POST, "/trade/market/orders/cancel", &[], Some(body), true).await
-    }
-
     /// Confirms credentials work and measures clock skew against the server.
     /// A skew over a couple of seconds makes every private call fail with
     /// `authz.nonce_expired`, and the error alone does not say why.
