@@ -163,28 +163,26 @@ impl Telegram {
         Self::keyboard_with(paused, None)
     }
 
-    /// The keyboard, plus a TWAP row while a twap runs: hold or resume it,
-    /// see its progress, and switch the 5% spike breather on or off.
-    /// `twap` is `(held, spike_on)`.
-    fn keyboard_with(paused: bool, twap: Option<(bool, bool)>) -> serde_json::Value {
+    /// The keyboard, plus a row while a twap or slow sell runs: hold or
+    /// resume it, and switch its guard on or off -- the 5% spike breather for
+    /// a buy, the 5% crash guard for a sell. `twap` is `(held, guard_on, sell)`.
+    fn keyboard_with(paused: bool, twap: Option<(bool, bool, bool)>) -> serde_json::Value {
         let mut kb = Self::base_keyboard(paused);
-        if let Some((held, spike_on)) = twap {
+        if let Some((held, guard_on, sell)) = twap {
+            let what = if sell { "sell" } else { "TWAP" };
             let hold = if held {
-                serde_json::json!({"text": "▶️ Resume TWAP", "callback_data": "twapgo"})
+                serde_json::json!({"text": format!("▶️ Resume {what}"), "callback_data": "twapgo"})
             } else {
-                serde_json::json!({"text": "✋ Hold TWAP", "callback_data": "twaphold"})
+                serde_json::json!({"text": format!("✋ Hold {what}"), "callback_data": "twaphold"})
             };
-            let spike = if spike_on {
-                serde_json::json!({"text": "🛡 Spike guard: on", "callback_data": "spike off"})
+            let (name, verb) = if sell { ("Crash", "crash") } else { ("Spike", "spike") };
+            let guard = if guard_on {
+                serde_json::json!({"text": format!("🛡 {name} guard: on"), "callback_data": format!("{verb} off")})
             } else {
-                serde_json::json!({"text": "🛡 Spike guard: off", "callback_data": "spike 5"})
+                serde_json::json!({"text": format!("🛡 {name} guard: off"), "callback_data": format!("{verb} 5")})
             };
             let rows = kb["inline_keyboard"].as_array_mut().expect("rows");
-            rows.insert(0, serde_json::json!([
-                hold,
-                {"text": "⏱ TWAP progress", "callback_data": "progress"}
-            ]));
-            rows.insert(1, serde_json::json!([spike]));
+            rows.insert(0, serde_json::json!([hold, guard]));
         }
         kb
     }
@@ -202,6 +200,7 @@ impl Telegram {
                     {"text": "📊 Details", "callback_data": "details 24h"}
                 ],
                 [
+                    {"text": "🔎 What I'm doing", "callback_data": "progress"},
                     {"text": "📅 Week", "callback_data": "details 7d"}
                 ],
                 [
@@ -222,14 +221,20 @@ impl Telegram {
         self.db.get_setting("enabled").await.ok().flatten().as_deref() == Some("false")
     }
 
-    /// `(held, spike_on)` while a twap runs, for the keyboard's TWAP row.
-    async fn twap_keys(&self) -> Option<(bool, bool)> {
+    /// `(held, guard_on, sell)` while a twap runs, for the keyboard's TWAP row.
+    async fn twap_keys(&self) -> Option<(bool, bool, bool)> {
         if !self.db.setting_bool("twap_only", false).await {
             return None;
         }
         let held = self.db.setting_bool("twap_hold", false).await;
-        let spike_on = self.db.setting_decimal("twap_spike_pct", dec!(5)).await > Decimal::ZERO;
-        Some((held, spike_on))
+        let base = self.base_ccy().await;
+        let sell = matches!(
+            self.db.active_program(&base).await,
+            Ok(Some(p)) if p.kind == ProgramKind::TwapSell
+        );
+        let (key, default) = if sell { ("twap_crash_pct", dec!(10)) } else { ("twap_spike_pct", dec!(5)) };
+        let guard_on = self.db.setting_decimal(key, default).await > Decimal::ZERO;
+        Some((held, guard_on, sell))
     }
 
     async fn send_to(&self, chat_id: i64, text: &str) -> Result<()> {
@@ -593,23 +598,37 @@ impl Telegram {
                 };
                 self.queue("set", serde_json::json!({ "key": "twap_spike_pct", "value": v.to_string() }), &msg).await
             }
-            "progress" => {
-                let base = self.base_ccy().await;
-                let markets = self.cfg.market_list();
-                Ok(match reporting::sell_progress(&self.db, &base, &markets).await? {
-                    Some(s) => s,
-                    None => reporting::twap_progress(&self.db, &base, &markets)
-                        .await?
-                        .unwrap_or_else(|| "No TWAP is running.".into()),
-                })
+            // The slow sell's mirror of the spike guard: `crash 5` pulls the
+            // asks while price is over 5% under the hour's high.
+            "crash" => {
+                let v = match args.first().map(|a| a.to_lowercase()) {
+                    Some(a) if a == "off" || a == "0" => Decimal::ZERO,
+                    Some(a) => a.trim_end_matches('%').parse::<Decimal>()
+                        .ok()
+                        .filter(|v| *v > Decimal::ZERO)
+                        .ok_or_else(|| anyhow::anyhow!("usage: <code>crash 5</code> or <code>crash off</code>"))?,
+                    None => dec!(5),
+                };
+                let msg = if v.is_zero() {
+                    "🛡 Crash guard off — the slow sell keeps its asks up through any drop.".to_string()
+                } else {
+                    format!("🛡 Crash guard on — the slow sell pulls its asks while price is over {v}% under the last hour's high.")
+                };
+                self.queue("set", serde_json::json!({ "key": "twap_crash_pct", "value": v.to_string() }), &msg).await
             }
+            "progress" | "now" | "doing" => self.progress().await,
 
             // TWAP the lot in: "twap 6h", "twap over 6h max 1.60".
             "twap" | "ripitin" => self.twap(&args).await,
             // Sell it all, slowly: "twapsell", "twapsell min 1.30".
             "twapsell" | "sellslow" => self.twapsell(&args).await,
+            // Buy with it all, slowly: "twapbuy max 1.40".
+            "twapbuy" | "buyslow" => self.twapbuy(&args).await,
 
             // The steady state: hold a share of value in PRL and rebalance.
+            // `balance` alone shows what the account holds; with a share it
+            // starts the rebalance program, as before.
+            "balance" | "balances" | "bal" | "holdings" if args.is_empty() => self.holdings().await,
             "balance" | "balanced" | "rebalance" => self.balance(&args).await,
             // Or let the arms decide the share, and keep deciding it.
             "learn" | "auto" => {
@@ -630,6 +649,24 @@ impl Telegram {
                 esc(other)
             )),
         }
+    }
+
+    /// What the bot is doing: the slow sell's or the twap's progress, or
+    /// that nothing is running.
+    async fn progress(&self) -> Result<String> {
+        let base = self.base_ccy().await;
+        let markets = self.cfg.market_list();
+        if let Some(s) = reporting::sell_progress(&self.db, &base, &markets).await? {
+            return Ok(s);
+        }
+        if let Some(s) = reporting::twap_progress(&self.db, &base, &markets).await? {
+            return Ok(s);
+        }
+        Ok(if self.is_paused().await {
+            "⏸ Paused — no program running, no orders.".into()
+        } else {
+            "No TWAP or slow sell is running.".into()
+        })
     }
 
     /// The base currency of the primary market, as the engine recorded it.
@@ -705,6 +742,49 @@ impl Telegram {
             &format!(
                 "✅ queued: slow sell of every {a} on the account, never below {floor}.\n\n\
                  Small asks joined to the lowest existing ask levels, never a new price, \
+                 never crossing. Under {day}% of the day's volume. Every other book stands down.",
+                a = asset.to_uppercase(),
+            ),
+        )
+        .await
+    }
+
+    /// `twapbuy max PRICE` — buy the base asset with every unit of cash,
+    /// slowly, bids only: the slow sell worked down the bid side. The ceiling
+    /// is required.
+    async fn twapbuy(&self, args: &[String]) -> Result<String> {
+        let mut ceiling: Option<Decimal> = None;
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].to_lowercase().as_str() {
+                "max" | "ceiling" | "limit" | "at" => {
+                    ceiling = args.get(i + 1).and_then(|v| v.parse().ok());
+                    i += 2;
+                }
+                v => {
+                    if let Ok(p) = v.parse() {
+                        ceiling = Some(p);
+                    }
+                    i += 1;
+                }
+            }
+        }
+        let Some(ceiling) = ceiling.filter(|p| *p > Decimal::ZERO) else {
+            return Ok("A slow buy needs a ceiling: <code>twapbuy max 1.40</code>".into());
+        };
+        let asset = self.base_ccy().await;
+        let day = self.db.setting_decimal("buy_day_pct", dec!(5)).await;
+        self.queue(
+            "program",
+            serde_json::json!({
+                "kind": "twapbuy",
+                "asset": asset,
+                "limit_price": ceiling.to_string(),
+                "note": "twapbuy: every unit of cash spent, slowly, via telegram",
+            }),
+            &format!(
+                "✅ queued: slow buy of {a} with all the cash on the account, never above {ceiling}.\n\n\
+                 Small bids joined to the best existing bid levels, never a new price, \
                  never crossing. Under {day}% of the day's volume. Every other book stands down.",
                 a = asset.to_uppercase(),
             ),
@@ -1020,18 +1100,25 @@ impl Telegram {
         }
     }
 
-    /// Push a status message on a fixed cadence.
-    ///
-    /// While a twap runs, every 15 minutes it sends the twap's progress
-    /// instead: cash left, bought, average price, resting orders and fills.
-    /// The owner asked for that cadence on 2026-10-07; the earnings screen
-    /// says little while the bot is only buying.
+    /// The balance of each asset, as a short message.
+    async fn holdings(&self) -> Result<String> {
+        let rows = reporting::holdings(&self.db).await;
+        if rows.is_empty() {
+            return Ok("💰 <b>Balances</b>\nnothing held".into());
+        }
+        let lines: Vec<String> = rows
+            .iter()
+            .map(|(c, v)| format!("{} <code>{}</code>", c.to_uppercase(), v))
+            .collect();
+        Ok(format!("💰 <b>Balances</b>\n{}", lines.join("\n")))
+    }
+
+    /// Send the balance of each asset on a fixed cadence (hourly by default).
+    /// The owner asked for just this on 2026-10-21: one short message an hour.
     pub async fn hourly_loop(self: Arc<Self>, shutdown: Arc<AtomicBool>, every: Duration) {
-        const TWAP_EVERY: Duration = Duration::from_secs(900);
-        let mut tick = tokio::time::interval(every.min(TWAP_EVERY));
+        let mut tick = tokio::time::interval(every);
         // The first tick fires immediately; skip it so a restart does not spam.
         tick.tick().await;
-        let mut last_earnings = tokio::time::Instant::now();
         while !shutdown.load(Ordering::Relaxed) {
             tick.tick().await;
             if shutdown.load(Ordering::Relaxed) {
@@ -1040,39 +1127,52 @@ impl Telegram {
             if self.chat_id().await.is_none() {
                 continue;
             }
-            let base = self.base_ccy().await;
-            // A slow sell runs for weeks: its progress replaces the hourly
-            // earnings, at the hourly cadence, not every 15 minutes.
-            let sell = reporting::sell_progress(&self.db, &base, &self.cfg.market_list()).await;
-            if let Ok(Some(body)) = sell {
-                if last_earnings.elapsed() + Duration::from_secs(5) >= every {
-                    last_earnings = tokio::time::Instant::now();
+            match self.holdings().await {
+                Ok(body) => {
                     let _ = self.send(&body).await;
                 }
+                Err(e) => warn!(error = %format!("{e:#}"), "could not build the balances"),
+            }
+        }
+    }
+
+    /// While a slow sell has something to sell, send its progress every
+    /// `every` (owner, 2026-10-27: "make sure i get regular updates in
+    /// telegram"). Quiet while paused, and while sold out with nothing new:
+    /// an update that says nothing changed is noise.
+    pub async fn sell_loop(self: Arc<Self>, shutdown: Arc<AtomicBool>, every: Duration) {
+        let mut tick = tokio::time::interval(every);
+        tick.tick().await;
+        let mut last_sent_ms = crate::db::now_ms();
+        while !shutdown.load(Ordering::Relaxed) {
+            tick.tick().await;
+            if shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+            if self.chat_id().await.is_none() || self.is_paused().await {
                 continue;
             }
-            match reporting::twap_progress(&self.db, &base, &self.cfg.market_list()).await {
+            let base = self.base_ccy().await;
+            let Ok(Some(p)) = self.db.active_program(&base).await else { continue };
+            if p.kind != ProgramKind::TwapSell {
+                continue;
+            }
+            let markets = self.cfg.market_list();
+            let mut sold = Decimal::ZERO;
+            for m in &markets {
+                sold += self.db.sold_since(m, last_sent_ms).await.unwrap_or_default();
+            }
+            if reporting::held(&self.db, &base).await < dec!(20) && sold.is_zero() {
+                continue;
+            }
+            match reporting::sell_progress(&self.db, &base, &markets).await {
                 Ok(Some(body)) => {
                     let _ = self.send(&body).await;
-                    continue;
+                    last_sent_ms = crate::db::now_ms();
                 }
                 Ok(None) => {}
-                Err(e) => warn!(error = %format!("{e:#}"), "could not build the twap progress"),
+                Err(e) => warn!(error = %format!("{e:#}"), "could not build the sell progress"),
             }
-            // A few seconds of slack: the ticks land on the interval, not after it.
-            if last_earnings.elapsed() + Duration::from_secs(5) < every {
-                continue;
-            }
-            last_earnings = tokio::time::Instant::now();
-            let built = self.earnings().await;
-            let body = match built {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!(error = %format!("{e:#}"), "could not build the hourly status");
-                    continue;
-                }
-            };
-            let _ = self.send(&body).await;
         }
     }
 }
@@ -1092,6 +1192,7 @@ fn help_text(market: &str) -> String {
     format!(
         "<b>SafeTrade bot — {}</b>\n\n\
          <b>Look</b>\n\
+         <code>balance</code> — how much of each asset the account holds\n\
          <code>status</code> — earnings: last hour, so far, and projected\n\
          <code>details</code> — holdings, P&amp;L, edge, what it is doing\n\
          <code>details 7d</code> — the same over a window (1h, 24h, 7d)\n\
@@ -1108,10 +1209,12 @@ fn help_text(market: &str) -> String {
          New capital that lands mid-run is worked in too, over a fresh window of its own.\n\
          <code>twaphold</code> / <code>twapgo</code> — hold the TWAP, or let it go on\n\
          <code>spike 5</code> — pause buying while price is 5% over the hour's low; <code>spike off</code>\n\
+         <code>crash 5</code> — pull sell asks while price is 5% under the hour's high; <code>crash off</code>\n\
          <code>progress</code> — USDT left, bought, average price, orders\n\n\
          <b>Sell it all, slowly</b> — asks only, no deadline\n\
          <code>twapsell</code> — every {base} for sale, small asks under 5% of the day's volume, never below 1.30\n\
          <code>twapsell min 1.35</code> — …never below 1.35\n\
+         <code>twapbuy max 1.40</code> — all the cash into {base}, small bids under 5% of the day's volume, never above 1.40\n\
          <code>set sell_day_pct 8</code> — change the pace; <code>twaphold</code> holds it too\n\n\
          <b>Set a stance</b> — an end state, not an amount to trade\n\
          <code>balance 50</code> — hold 50% of <i>value</i> in {base}, forever\n\
@@ -1188,9 +1291,12 @@ mod tests {
         let known = [
             "status", "details", "report", "edge", "orders", "pause", "resume", "panic",
             "help", "settings", "set", "buy", "sell", "hold", "flat", "twap", "balance",
-            "twaphold", "twapgo", "spike", "progress",
+            "twaphold", "twapgo", "spike", "crash", "progress",
         ];
-        for (paused, twap) in [(false, None), (true, None), (false, Some((false, true))), (true, Some((true, false)))] {
+        for (paused, twap) in [
+            (false, None), (true, None), (false, Some((false, true, false))), (true, Some((true, false, false))),
+            (false, Some((false, true, true))), (true, Some((true, false, true))),
+        ] {
             let kb = Telegram::keyboard_with(paused, twap);
             let rows = kb["inline_keyboard"].as_array().expect("rows");
             let mut count = 0;

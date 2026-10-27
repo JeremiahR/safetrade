@@ -194,7 +194,7 @@ mod tests {
     /// 6.5% measures almost none of it.
     #[test]
     fn the_thin_book_s_asks_are_not_capped_by_a_band_narrower_than_its_spread() {
-        let q = prod_for("prlusdc");
+        let q = prod_for("pearlusdc");
         assert!(
             q.depth_band >= dec!(0.10),
             "the band must cover this book's ~6.5% spread, got {}",
@@ -216,7 +216,7 @@ mod tests {
         assert!(g.depth_band <= dec!(0.05), "{}", g.depth_band);
     }
 
-    /// The production prlusdt side wants about a quarter of equity at full
+    /// The production pearlusdt side wants about a quarter of equity at full
     /// size: two rungs of 3% at 1.5x growth, fitted at 55% of the balance
     /// left after the deep ladder's 45% slice. The deep ladder itself wants
     /// 24% of the PRL held. Every side at full size is under two thirds of
@@ -228,21 +228,21 @@ mod tests {
         let inventory = dec!(3661);
         let prl = side_funding(&q, equity, inventory, price);
         assert!(prl > equity * dec!(0.20) && prl < equity * dec!(0.30), "{prl}");
-        // prlusdc wants ~18% of equity since 2026-09-30: a 4% rung on a book
+        // pearlusdc wants ~18% of equity since 2026-09-30: a 4% rung on a book
         // that had shrunk keeps its orders in the size zone where its fills
         // pay. The percentage follows the dollar rung, not the other way
         // round; see the config.
-        let thin = prod_for("prlusdc");
+        let thin = prod_for("pearlusdc");
         let usdc = side_funding(&thin, equity, inventory, price);
         assert!(usdc > equity * dec!(0.17) && usdc < equity * dec!(0.19), "{usdc}");
         let stable = prod_for("usdcusdt");
         let s = side_funding(&stable, dec!(2069), dec!(374), Decimal::ONE);
         assert!(s > dec!(2069) * dec!(0.02) && s < dec!(2069) * dec!(0.03), "{s}");
         // Both sides of every book that rests a ladder, at full size, in one
-        // account's worth of value. prlusdt is not one: it is a cycle leg
+        // account's worth of value. pearlusdt is not one: it is a cycle leg
         // (`cycle_leg_only`) and funds no ladder, so its `prl` figure above
         // is what it WOULD need, not a claim.
-        assert!(prod_for("prlusdt").cycle_leg_only, "prlusdt must stay a leg for this bound to hold");
+        assert!(prod_for("pearlusdt").cycle_leg_only, "pearlusdt must stay a leg for this bound to hold");
         assert!(dec!(2) * (usdc + s) < equity * dec!(0.70));
     }
 

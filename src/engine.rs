@@ -88,6 +88,11 @@ pub struct Engine {
     /// Withdrawals requested but not yet settled, per currency. The exchange
     /// locks these funds; they are not inventory.
     pending_out: HashMap<String, Decimal>,
+    /// Currencies with a deposit the exchange has seen but not yet credited.
+    pending_in: HashSet<String>,
+    /// Since when the slow sell has had nothing left to sell; see
+    /// `chain_buyback`.
+    sold_out_since: Option<i64>,
     /// Lighter's PRL perpetual, watched and recorded; see `exchange::lighter`.
     lighter: Option<crate::exchange::lighter::Lighter>,
     /// When each market was last measured. Timed rather than counted, so a
@@ -150,6 +155,11 @@ const SELL_FLOOR: Decimal = dec!(1.30);
 /// The loop still runs every few seconds for fills, commands and pause; only
 /// the ask placement waits. The owner, 2026-10-10: "20 seconds is aggressive".
 const SELL_EVERY_SECS: i64 = 120;
+
+/// The slow sell's liquidation pace, by default (`sell_hours`): a holding
+/// sells out over about this many hours. The owner, 2026-10-21: "no rush but
+/// targeting 24-48 hours to liquidate".
+const SELL_HOURS: i64 = 36;
 
 const CONFIG_LIVE_KEY: &str = "config_live";
 
@@ -373,6 +383,8 @@ impl Engine {
             market_failures: HashMap::new(),
             tick_failures: 0,
             pending_out: HashMap::new(),
+            pending_in: HashSet::new(),
+            sold_out_since: None,
             lighter,
             last_measured: HashMap::new(),
             arm_sizes,
@@ -963,6 +975,9 @@ impl Engine {
         // yet shipped.
         let balances = self.without_pending_withdrawals(self.api.balances().await?);
         self.record_balances(&balances).await;
+        if let Err(e) = self.chain_buyback(&balances).await {
+            warn!(error = %format!("{e:#}"), "follow-on buy check failed");
+        }
 
         self.loop_n = self.loop_n.wrapping_add(1);
 
@@ -1563,25 +1578,33 @@ impl Engine {
         // sides. See `Quoting::cycle_churn`.
         let cycle_churn = self.cycle_churn(&market.id, &params);
 
-        let sell = program.as_ref().filter(|p| p.kind == ProgramKind::TwapSell);
-        if sell.is_some() {
-            // Between passes the asks are left alone. A pause or a hold acts
+        let sell = program.as_ref().filter(|p| p.kind.is_slow());
+        if let Some(p) = sell {
+            let buy = p.kind == ProgramKind::TwapBuy;
+            let k = if buy { "buy" } else { "sell" };
+            // Between passes the orders are left alone. A pause or a hold acts
             // at once, never waiting out the interval.
-            let every = self.db.setting_decimal("sell_every_secs", Decimal::from(SELL_EVERY_SECS)).await;
+            let every = self.db.setting_decimal(&format!("{k}_every_secs"), Decimal::from(SELL_EVERY_SECS)).await;
             let every_ms = i64::try_from(every.round()).unwrap_or(SELL_EVERY_SECS).max(5) * 1000;
             let last = self.sell_planned.get(&market.id).copied().unwrap_or(0);
-            let stop = !params.enabled || self.db.setting_bool("twap_hold", false).await;
-            // An ask that filled since the last pass is refilled now, not up
-            // to two minutes later: a sweep is when the buying is there.
-            let filled = last > 0
-                && self.db.sold_since(&market.id, last).await.unwrap_or_default() > Decimal::ZERO;
+            let stop = !params.enabled
+                || self.db.setting_bool("twap_hold", false).await
+                || self.slow_skips(&market.id).await;
+            // An order that filled since the last pass is refilled now, not up
+            // to two minutes later: a sweep is when the other side is there.
+            let since = if buy {
+                self.db.bought_since(&market.id, last).await
+            } else {
+                self.db.sold_since(&market.id, last).await
+            };
+            let filled = last > 0 && since.unwrap_or_default() > Decimal::ZERO;
             if !stop && !filled && now_ms() - last < every_ms {
                 return Ok(());
             }
             self.sell_planned.insert(market.id.clone(), now_ms());
         }
         let decision = if let Some(p) = sell {
-            self.plan_sell(market, &public_book, live, p, &params, base_avail, inventory).await
+            self.plan_sell(market, &public_book, live, p, &params, base_avail, quote_avail, inventory).await
         } else {
             plan(&QuoteInput {
             cycle_release_floor,
@@ -1637,9 +1660,20 @@ impl Engine {
                 if self.db.setting_bool("twap_hold", false).await {
                     Decision::halted(Halt::TwapHeld, decision.target_inventory)
                 } else if p.kind == ProgramKind::TwapSell {
-                    // The spike guard is for buying. A spike is what the slow
-                    // sell is waiting for.
-                    decision
+                    // The spike guard is for buying; a spike is what the slow
+                    // sell is waiting for. Its mirror is a crash: stand back
+                    // while price is well under the hour's high. Asked for on
+                    // 2026-10-19: "dont sell pearl into a crash".
+                    let pct = self.db.setting_decimal("twap_crash_pct", dec!(10)).await;
+                    match (pct > Decimal::ZERO, decision.fair_value) {
+                        (true, Some(fv)) => match self.db.hour_high(&market.id).await {
+                            Some(high) if high > Decimal::ZERO && (high - fv) / high * dec!(100) > pct => {
+                                Decision::halted(Halt::TwapCrash { fall: (high - fv) / high }, decision.target_inventory)
+                            }
+                            _ => decision,
+                        },
+                        _ => decision,
+                    }
                 } else {
                     let pct = self.db.setting_decimal("twap_spike_pct", dec!(5)).await;
                     match (pct > Decimal::ZERO, decision.fair_value) {
@@ -1741,7 +1775,7 @@ impl Engine {
         // the spread to keep a schedule the passive ladder cannot keep. After
         // the ladder, so the crossing is sized against what the rungs did not
         // already commit, and bounded by every cap in `take_if_behind`.
-        if let (Some(p), Some(fv)) = (program.as_ref().filter(|p| p.kind != ProgramKind::TwapSell), decision.fair_value) {
+        if let (Some(p), Some(fv)) = (program.as_ref().filter(|p| !p.kind.is_slow()), decision.fair_value) {
             self.take_if_behind(
                 market,
                 &public_book,
@@ -1770,6 +1804,40 @@ impl Engine {
         Ok(())
     }
 
+    /// Quote currency held back for other budgeted slow buys: what each has
+    /// left of its budget after what it spent and what its open bids hold.
+    /// Only budgets worked on a book quoted in `quote` count. A count that
+    /// cannot be read reserves the whole budget, never nothing.
+    async fn reserved_for_budgets(&self, except: i64, quote: &str) -> Decimal {
+        let mut reserved = Decimal::ZERO;
+        for base in distinct(self.markets.iter().map(|m| m.base_unit.clone())) {
+            let Ok(Some(p)) = self.db.active_program(&base).await else { continue };
+            let Some(budget) = p.budget.filter(|_| p.kind == ProgramKind::TwapBuy && p.id != except) else {
+                continue;
+            };
+            if !self.markets.iter().any(|m| m.base_unit == base && m.quote_unit == quote) {
+                continue;
+            }
+            reserved += match self.db.program_buy_spend(p.id).await {
+                Ok((spent, committed)) => (budget - spent - committed).max(Decimal::ZERO),
+                Err(_) => budget,
+            };
+        }
+        reserved
+    }
+
+    /// Whether `slow_skip` names this book: the slow sell and slow buy stay
+    /// out of it and pull what they have resting there. Asked for on
+    /// 2026-10-14: "pull the usdc sells".
+    async fn slow_skips(&self, market: &str) -> bool {
+        self.db
+            .get_setting("slow_skip")
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|v| v.split(',').any(|m| m.trim().eq_ignore_ascii_case(market)))
+    }
+
     /// The slow sell's decision for one book: small asks joined to the
     /// strangers' lowest levels, capped by the tape. See `strategy::sell`.
     ///
@@ -1785,11 +1853,17 @@ impl Engine {
         program: &Program,
         params: &Params,
         base_avail: Decimal,
+        quote_avail: Decimal,
         inventory: Decimal,
     ) -> Decision {
         if !params.enabled {
             return Decision::halted(Halt::Disabled, inventory);
         }
+        if self.slow_skips(&market.id).await {
+            return Decision::halted(Halt::SlowSkip, inventory);
+        }
+        let buy = program.kind == ProgramKind::TwapBuy;
+        let k = if buy { "buy" } else { "sell" };
         let best_bid = book.best_bid().map(|(p, _)| p);
         if best_bid.is_none() && book.asks.is_empty() {
             return Decision::halted(Halt::EmptyBook, inventory);
@@ -1799,17 +1873,28 @@ impl Engine {
         let pct = |v: Decimal| v / dec!(100);
         let count = |v: Decimal, d: usize| v.round().to_string().parse::<usize>().unwrap_or(d).min(50);
         let d = crate::strategy::sell::SellParams::default();
+        // The buy reads its own `buy_*` knobs, so tuning one side never moves
+        // the other. Its boost is off unless set: the sell's default boost
+        // price is a selling price.
+        let setting = |name: &str| format!("{k}_{name}");
+        let boost_default = if buy { Decimal::ZERO } else { d.boost_price };
         let sp = crate::strategy::sell::SellParams {
-            day_rate: pct(self.db.setting_decimal("sell_day_pct", d.day_rate * dec!(100)).await),
-            hour_rate: pct(self.db.setting_decimal("sell_hour_pct", d.hour_rate * dec!(100)).await),
-            levels: count(self.db.setting_decimal("sell_levels", Decimal::from(d.levels)).await, d.levels),
-            keep_levels: count(self.db.setting_decimal("sell_keep_levels", Decimal::from(d.keep_levels)).await, d.keep_levels),
-            level_share: pct(self.db.setting_decimal("sell_level_pct", d.level_share * dec!(100)).await),
-            max_order: self.db.setting_decimal("sell_max_order", d.max_order).await,
+            day_rate: pct(self.db.setting_decimal(&setting("day_pct"), d.day_rate * dec!(100)).await),
+            hour_rate: pct(self.db.setting_decimal(&setting("hour_pct"), d.hour_rate * dec!(100)).await),
+            levels: count(self.db.setting_decimal(&setting("levels"), Decimal::from(d.levels)).await, d.levels),
+            keep_levels: count(self.db.setting_decimal(&setting("keep_levels"), Decimal::from(d.keep_levels)).await, d.keep_levels),
+            level_share: pct(self.db.setting_decimal(&setting("level_pct"), d.level_share * dec!(100)).await),
+            max_order: self.db.setting_decimal(&setting("max_order"), d.max_order).await,
             min_order: d.min_order,
-            stand_back: self.db.setting_decimal("sell_stand_back", d.stand_back).await,
-            boost_price: self.db.setting_decimal("sell_boost_price", d.boost_price).await,
-            boost: self.db.setting_decimal("sell_boost", d.boost).await,
+            stand_back: self.db.setting_decimal(&setting("stand_back"), d.stand_back).await,
+            boost_price: self.db.setting_decimal(&setting("boost_price"), boost_default).await,
+            boost: self.db.setting_decimal(&setting("boost"), d.boost).await,
+            min_notional: self.db.setting_decimal(&setting("min_notional"), d.min_notional).await,
+            near_levels: count(self.db.setting_decimal(&setting("near_levels"), Decimal::from(d.near_levels)).await, d.near_levels),
+            near_share: pct(self.db.setting_decimal(&setting("near_pct"), d.near_share * dec!(100)).await).min(Decimal::ONE),
+            spike_rungs: count(self.db.setting_decimal(&setting("spike_rungs"), Decimal::from(d.spike_rungs)).await, d.spike_rungs),
+            spike_step: pct(self.db.setting_decimal(&setting("spike_step_pct"), d.spike_step * dec!(100)).await),
+            spike_share: pct(self.db.setting_decimal(&setting("spike_pct"), d.spike_share * dec!(100)).await).min(Decimal::ONE),
             ..d
         };
         // Who is trading, over every book on this asset: the deep book's
@@ -1826,11 +1911,129 @@ impl Engine {
         // Too little traded to say who is driving: no opinion.
         let flow = (bought + sold >= self.db.setting_decimal("sell_flow_min_volume", dec!(1000)).await)
             .then(|| (bought - sold) / (bought + sold));
+        let side = if buy { Side::Buy } else { Side::Sell };
         let resting: Vec<crate::strategy::sell::Resting> = live
             .iter()
-            .filter(|o| o.side == Side::Sell)
-            .map(|o| crate::strategy::sell::Resting { price: o.price, remaining: o.remaining() })
+            .filter(|o| o.side == side)
+            .map(|o| crate::strategy::sell::Resting { price: o.price, level: o.level, remaining: o.remaining() })
             .collect();
+        let seed = now as u64 ^ market.id.bytes().fold(0u64, |a, b| a.wrapping_mul(131).wrapping_add(b as u64));
+        let fair_value = match (best_bid, book.best_ask().map(|(p, _)| p)) {
+            (Some(b), Some(a)) => Some((b + a) / Decimal::TWO),
+            (b, a) => b.or(a),
+        };
+        if buy {
+            let Some(ceiling) = program.limit_price.filter(|p| *p > Decimal::ZERO) else {
+                // Refused at creation; a row from elsewhere without one buys nothing.
+                return Decision::halted(Halt::Disabled, inventory);
+            };
+            // `buy_qty` caps what this program puts in the account, net of the
+            // fee taken in the base, counted from its own fills. What is left
+            // is grossed up by the fee these fills actually paid (0.10% until
+            // one has), so the last bids land on the number, not a fee short.
+            let cap = self.db.setting_decimal("buy_qty", Decimal::ZERO).await;
+            let max_base = if cap > Decimal::ZERO {
+                let Ok((net, gross)) = self.db.program_received(program.id, &market.base_unit).await else {
+                    return Decision::halted(Halt::Disabled, inventory);
+                };
+                let left = cap - net;
+                if left <= Decimal::ZERO {
+                    return Decision::halted(Halt::BuyQtyDone { received: net }, inventory);
+                }
+                let keep = if gross > Decimal::ZERO { net / gross } else { dec!(0.999) };
+                let committed: Decimal = resting.iter().map(|r| r.remaining).sum();
+                Some((left / keep.max(dec!(0.9)) - committed).max(Decimal::ZERO))
+            } else {
+                None
+            };
+            // A budget caps what this program spends, counted from its own
+            // fills plus what its open bids already hold. Asked for on
+            // 2026-10-17: "buy me $10,000 worth of NOID" beside a PRL buy
+            // spending everything else.
+            let mut free_quote = quote_avail;
+            if let Some(budget) = program.budget {
+                let Ok((spent, _)) = self.db.program_buy_spend(program.id).await else {
+                    return Decision::halted(Halt::Disabled, inventory);
+                };
+                if spent >= budget {
+                    return Decision::halted(Halt::BudgetDone { spent }, inventory);
+                }
+                let committed: Decimal = resting.iter().map(|r| r.price * r.remaining).sum();
+                free_quote = free_quote.min((budget - spent - committed).max(Decimal::ZERO));
+            }
+            // And every slow buy leaves the unspent part of the OTHER budgets
+            // alone, so the two do not race for the same cash.
+            let reserved = self.reserved_for_budgets(program.id, &market.quote_unit).await;
+            free_quote = (free_quote.min(quote_avail - reserved)).max(Decimal::ZERO);
+            let input = crate::strategy::sell::BuyInput {
+                market,
+                bids: &book.bids,
+                best_ask: book.best_ask().map(|(p, _)| p),
+                ceiling,
+                volume_24h: self.db.tape_volume(&market.id, day_ago).await.unwrap_or_default(),
+                bought_24h: self.db.bought_since(&market.id, day_ago).await.unwrap_or_default(),
+                volume_1h: self.db.tape_volume(&market.id, hour_ago).await.unwrap_or_default(),
+                bought_1h: self.db.bought_since(&market.id, hour_ago).await.unwrap_or_default(),
+                free_quote,
+                max_base,
+                resting: &resting,
+                flow,
+                seed,
+                params: sp,
+            };
+            let quotes = crate::strategy::sell::buy_ladder(&input);
+            info!(
+                market = %market.id, %ceiling, best_bid = ?best_bid,
+                volume_24h = %input.volume_24h.round_dp(0), bought_24h = %input.bought_24h.round_dp(0),
+                volume_1h = %input.volume_1h.round_dp(0), bought_1h = %input.bought_1h.round_dp(0),
+                room = %input.room().round_dp(0), free_quote = %free_quote.round_dp(2),
+                budget = ?program.budget, reserved = %reserved.round_dp(2), resting = resting.len(),
+                bids = quotes.len(), flow = ?flow.map(|f| f.round_dp(2)), flow_scale = %input.flow_scale().round_dp(2),
+                "slow buy"
+            );
+            return Decision { quotes, halt: None, fair_value, target_inventory: inventory };
+        }
+        // `sell_qty` caps what this program sells, counted from its own fills
+        // so a deposit or a manual trade cannot move the count. New asks only
+        // get what is left after what already rests. Asked for on
+        // 2026-10-15: "keep track of what you sell, and don't go over".
+        let cap = self.db.setting_decimal("sell_qty", Decimal::ZERO).await;
+        let free = if cap > Decimal::ZERO {
+            let Ok(sold) = self.db.program_filled(program.id, "sell").await else {
+                // No count, no selling: never guess past the cap.
+                return Decision::halted(Halt::Disabled, inventory);
+            };
+            let left = cap - sold;
+            if left <= Decimal::ZERO {
+                return Decision::halted(Halt::SellQtyDone { sold }, inventory);
+            }
+            let committed: Decimal = resting.iter().map(|r| r.remaining).sum();
+            base_avail.min((left - committed).max(Decimal::ZERO))
+        } else {
+            base_avail
+        };
+        // The liquidation pace, over every book on this asset: a holding
+        // sells out over about `sell_hours`, never faster. 0 turns it off.
+        let hours = self.db.setting_decimal("sell_hours", Decimal::from(SELL_HOURS)).await;
+        let pace = if hours > Decimal::ZERO {
+            let window_ago = now - crate::strategy::sell::PACE_WINDOW_HOURS * 3_600_000;
+            let (mut sold_day, mut sold_window) = (Decimal::ZERO, Decimal::ZERO);
+            for m in self.markets.iter().filter(|m| m.base_unit == market.base_unit) {
+                sold_day += self.db.sold_since(&m.id, day_ago).await.unwrap_or_default();
+                sold_window += self.db.sold_since(&m.id, window_ago).await.unwrap_or_default();
+            }
+            let committed: Decimal = resting.iter().map(|r| r.remaining).sum();
+            Some(crate::strategy::sell::pace_room(
+                inventory,
+                sold_day,
+                sold_window,
+                committed,
+                hours,
+                sp.min_order.max(market.min_amount),
+            ))
+        } else {
+            None
+        };
         let input = crate::strategy::sell::SellInput {
             market,
             asks: &book.asks,
@@ -1840,10 +2043,11 @@ impl Engine {
             sold_24h: self.db.sold_since(&market.id, day_ago).await.unwrap_or_default(),
             volume_1h: self.db.tape_volume(&market.id, hour_ago).await.unwrap_or_default(),
             sold_1h: self.db.sold_since(&market.id, hour_ago).await.unwrap_or_default(),
-            free: base_avail,
+            free,
             resting: &resting,
             flow,
-            seed: now as u64 ^ market.id.bytes().fold(0u64, |a, b| a.wrapping_mul(131).wrapping_add(b as u64)),
+            seed,
+            pace,
             params: sp,
         };
         let quotes = crate::strategy::sell::ladder(&input);
@@ -1851,14 +2055,10 @@ impl Engine {
             market = %market.id, floor = %input.floor, best_ask = ?book.best_ask().map(|(p, _)| p),
             volume_24h = %input.volume_24h.round_dp(0), sold_24h = %input.sold_24h.round_dp(0),
             volume_1h = %input.volume_1h.round_dp(0), sold_1h = %input.sold_1h.round_dp(0),
-            room = %input.room().round_dp(0), resting = resting.len(), asks = quotes.len(),
+            room = %input.room().round_dp(0), pace = ?pace.map(|p| p.round_dp(0)), resting = resting.len(), asks = quotes.len(),
             flow = ?flow.map(|f| f.round_dp(2)), flow_scale = %input.flow_scale().round_dp(2),
             "slow sell"
         );
-        let fair_value = match (best_bid, book.best_ask().map(|(p, _)| p)) {
-            (Some(b), Some(a)) => Some((b + a) / Decimal::TWO),
-            (b, a) => b.or(a),
-        };
         Decision { quotes, halt: None, fair_value, target_inventory: inventory }
     }
 
@@ -2167,6 +2367,32 @@ impl Engine {
         // Tracked per currency and subtracted from `locked` wherever balances
         // are read. It clears itself: once the withdrawal settles it leaves the
         // balance for real and stops being pending.
+        // A deposit seen but not credited is coins on their way to the sale:
+        // the follow-on buy must not start under it. Only recent ones, and
+        // never one the exchange has given up on.
+        self.pending_in.clear();
+        let recent = now_ms() - 2 * 86_400_000;
+        for t in deposits.iter().filter(|t| !t.is_settled()) {
+            let failed = t.status.as_deref().is_some_and(|s| {
+                matches!(
+                    s.to_lowercase().as_str(),
+                    "rejected" | "canceled" | "cancelled" | "failed" | "errored" | "refunded" | "skipped"
+                )
+            });
+            let created = t
+                .created_at
+                .as_deref()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|d| d.timestamp_millis())
+                .unwrap_or(0);
+            if !failed && created >= recent {
+                self.pending_in.insert(t.currency.to_lowercase());
+            }
+        }
+        if !self.pending_in.is_empty() {
+            info!(pending = ?self.pending_in, "deposits arriving, not yet credited");
+        }
+
         self.pending_out.clear();
         for t in &withdrawals {
             match t.pending_reason() {
@@ -3339,7 +3565,7 @@ impl Engine {
                     .context("program needs a valid kind")?;
                 // A twap needs no target typed: it works the whole account in.
                 let requested = match kind {
-                    ProgramKind::Twap | ProgramKind::TwapSell => Decimal::ZERO,
+                    ProgramKind::Twap | ProgramKind::TwapSell | ProgramKind::TwapBuy => Decimal::ZERO,
                     _ => dec_arg("target").context("program needs a target")?,
                 };
                 // Programs are filed per asset, so a command may name one.
@@ -3355,6 +3581,11 @@ impl Engine {
                 let relative = args.get("relative").and_then(|v| v.as_bool()).unwrap_or(false);
                 let target = if relative { inventory + requested } else { requested };
                 let ends_at = args.get("duration_secs").and_then(|v| v.as_i64()).map(|d| now_ms() + d * 1000);
+                // A slow buy spends every unit of cash. Without a ceiling that
+                // is an order to buy at any price, which is never what is meant.
+                if kind == ProgramKind::TwapBuy && dec_arg("limit_price").is_none_or(|p| p <= Decimal::ZERO) {
+                    bail!("a slow buy needs a ceiling (limit_price)");
+                }
 
                 // A twap's target is derived from live balances every loop, so
                 // what is stored is only the snapshot completion checks against:
@@ -3397,12 +3628,25 @@ impl Engine {
                     )
                     .await?;
 
+                let budget = dec_arg("budget").filter(|b| *b > Decimal::ZERO && kind == ProgramKind::TwapBuy);
+                if let Some(b) = budget {
+                    self.db.set_program_budget(id, b).await?;
+                }
+
                 // TWAP mode lives and dies with a twap program, so the flag is
                 // set here rather than left to the operator to remember. Any
                 // other program clears it: the alternative is a bot that looks
                 // like it is market-making and is silently standing down.
                 let twap = kind == ProgramKind::Twap;
                 self.db.set_setting("twap_only", if kind.is_twap() { "true" } else { "false" }).await?;
+                if kind == ProgramKind::TwapBuy {
+                    return Ok(format!(
+                        "program {id} on {asset} (slow buy) — {}, never above {}; \
+                         TWAP mode on: bids only, every other book stands down",
+                        budget.map_or("every unit of cash spent".to_string(), |b| format!("spends at most {b}")),
+                        dec_arg("limit_price").unwrap_or_default()
+                    ));
+                }
                 if kind == ProgramKind::TwapSell {
                     return Ok(format!(
                         "program {id} on {asset} (slow sell) — every unit for sale, never below {}; \
@@ -3425,6 +3669,75 @@ impl Engine {
             }
             other => Ok(format!("unknown command {other}")),
         }
+    }
+
+    /// Once a slow sell has sold everything, start the buy queued behind it
+    /// (`then_buy_qty`), once. Asked for on 2026-10-15: "when it hits zero it
+    /// begins buying up to 11,000".
+    ///
+    /// "Everything" is under the smallest order the sell will place, with no
+    /// deposit arriving, held for `then_buy_after_mins` -- the exchange only
+    /// shows a deposit once it has seen it on chain, so a quiet spell is the
+    /// only guard against one still being sent. It goes through the command
+    /// queue, so it is in `ctl log` like anything typed.
+    async fn chain_buyback(&mut self, balances: &[Balance]) -> Result<()> {
+        let qty = self.db.setting_decimal("then_buy_qty", Decimal::ZERO).await;
+        if qty <= Decimal::ZERO {
+            self.sold_out_since = None;
+            return Ok(());
+        }
+        let base = self.markets[0].base_unit.clone();
+        let selling = self
+            .db
+            .active_program(&base)
+            .await?
+            .is_some_and(|p| p.kind == ProgramKind::TwapSell);
+        let (avail, locked) = balance_of(balances, &base);
+        let left = avail + locked;
+        let min_order = crate::strategy::sell::SellParams::default().min_order;
+        if !selling || left >= min_order || self.pending_in.contains(&base) {
+            self.sold_out_since = None;
+            return Ok(());
+        }
+        let since = *self.sold_out_since.get_or_insert_with(now_ms);
+        let mins = self.db.setting_decimal("then_buy_after_mins", dec!(15)).await;
+        let wait = i64::try_from((mins * dec!(60000)).round()).unwrap_or(900_000);
+        if now_ms() - since < wait {
+            return Ok(());
+        }
+        let ceiling = self.db.setting_decimal("then_buy_ceiling", Decimal::ZERO).await;
+        if ceiling <= Decimal::ZERO {
+            warn!("sold out, but then_buy_ceiling is not set; not starting the follow-on buy");
+            return Ok(());
+        }
+        // Cleared first: whatever happens next, it fires once.
+        self.db.set_setting("then_buy_qty", "0").await?;
+        self.sold_out_since = None;
+        self.db
+            .push_command("set", serde_json::json!({ "key": "buy_qty", "value": qty.to_string() }))
+            .await?;
+        self.db
+            .push_command(
+                "program",
+                serde_json::json!({
+                    "kind": "twapbuy",
+                    "asset": base,
+                    "limit_price": ceiling.to_string(),
+                    "note": format!("follow-on buy: {qty} {} after the slow sell sold out", base.to_uppercase()),
+                }),
+            )
+            .await?;
+        info!(%qty, %ceiling, %left, "slow sell sold out; follow-on buy queued");
+        self.db
+            .alert(
+                "program",
+                &format!(
+                    "{}: slow sell sold out ({left} left). Buying {qty} back, slowly, never above {ceiling}.",
+                    base.to_uppercase()
+                ),
+            )
+            .await;
+        Ok(())
     }
 
     async fn cancel_all_markets(&self) {
@@ -4661,6 +4974,7 @@ mod tests {
             ratio: None,
             banked: Decimal::ZERO,
             limit_price: limit,
+            budget: None,
             started_at: 0,
             ends_at: Some(6 * 3_600_000),
             note: None,
@@ -4988,7 +5302,7 @@ mod tests {
         markets.markets.pop();
         assert_ne!(strategy_fingerprint(&base), strategy_fingerprint(&markets));
         let mut ov = base.clone();
-        ov.overrides.get_mut("prlusdc").unwrap().levels = Some(1);
+        ov.overrides.get_mut("pearlusdc").unwrap().levels = Some(1);
         assert_ne!(strategy_fingerprint(&base), strategy_fingerprint(&ov));
     }
 

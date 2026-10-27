@@ -96,8 +96,19 @@ pub enum Halt {
     /// A twap taking a breather: price rose more than `twap_spike_pct` over
     /// the last hour, measured from the hour's low.
     TwapSpike { rise: Decimal },
+    /// A slow sell standing back from a crash: price fell more than
+    /// `twap_crash_pct` over the last hour, measured from the hour's high.
+    TwapCrash { fall: Decimal },
     /// A twap the owner put on hold by hand (`twap_hold`).
     TwapHeld,
+    /// A slow sell or slow buy told to stay out of this book (`slow_skip`).
+    SlowSkip,
+    /// A slow sell that has sold all of `sell_qty`.
+    SellQtyDone { sold: Decimal },
+    /// A slow buy that has received all of `buy_qty`.
+    BuyQtyDone { received: Decimal },
+    /// A slow buy that has spent all of its budget.
+    BudgetDone { spent: Decimal },
 }
 
 impl Halt {
@@ -123,7 +134,15 @@ impl Halt {
                 "TWAP breather: price is up {:.1}% on the hour's low",
                 rise * dec!(100)
             ),
+            Halt::TwapCrash { fall } => format!(
+                "slow sell standing back: price is down {:.1}% from the hour's high",
+                fall * dec!(100)
+            ),
             Halt::TwapHeld => "TWAP on hold (twap_hold)".into(),
+            Halt::SlowSkip => "slow sell/buy stays out of this book (slow_skip)".into(),
+            Halt::SellQtyDone { sold } => format!("slow sell done: sold {sold}, all of sell_qty"),
+            Halt::BuyQtyDone { received } => format!("slow buy done: received {received}, all of buy_qty"),
+            Halt::BudgetDone { spent } => format!("slow buy done: spent {spent}, all of its budget"),
             Halt::NoReference => {
                 "no fair value from the deeper book this loop — not quoting this one off its own residue"
                     .into()
@@ -1143,6 +1162,7 @@ mod tests {
             ratio: None,
             banked: Decimal::ZERO,
             limit_price: None,
+            budget: None,
             started_at: 0,
             ends_at: if dur_ms > 0 { Some(dur_ms) } else { None },
             note: None,

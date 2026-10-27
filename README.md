@@ -31,6 +31,7 @@ the patience.
 | `learned`    | `balanced`, with the share **set by the arms** hourly | the split follows the yield |
 | `twap`       | **everything the cash can buy**, live   | buy-only TWAP, nothing else quoting |
 | `twapsell`   | **zero**: every unit is for sale, live  | sell-only TWAP, nothing else quoting |
+| `twapbuy`    | **everything the cash can buy**, live   | the slow sell, worked down the bid side |
 
 Because all of them are just a number, there is one quoting path and no
 separate execution engine. Switching stance at runtime is changing the target,
@@ -192,6 +193,9 @@ safetrade ctl twap --over 6h
 # Sell every PRL on the account, slowly, asks only, never below 1.30
 safetrade ctl twapsell --floor 1.30
 
+# Buy PRL with all the cash on the account, the same way, never above 1.40
+safetrade ctl twapbuy --ceiling 1.40
+
 # Accumulate 20,000 PRL over two days, never paying above 1.02
 safetrade ctl program accumulate 20000 --over 2d --limit-price 1.02
 
@@ -258,6 +262,7 @@ It posts a status message every hour (`telegram_status_secs`) and answers:
 | `twap 6h` | put every spendable unit into PRL over six hours, bids only |
 | `twap 6h max 1.60` | …never paying above 1.60 |
 | `twapsell min 1.30` | sell every PRL slowly, asks only, never below 1.30 |
+| `twapbuy max 1.40` | buy PRL with all the cash slowly, bids only, never above 1.40 |
 | `balance 50` | hold 50% of value in PRL, rebalancing forever |
 | `balance 50 over 24h` | …easing into it over a day |
 | `hold 20000` | market-make around an absolute quantity |
@@ -536,6 +541,35 @@ coins. It works the ask side like a small iceberg (`src/strategy/sell.rs`):
   resting through a restart.
 
 Every other book stands down while it runs. `ctl set` lists the `sell_*` knobs.
+
+### Slow buy: the same, down the bid side
+
+```sh
+safetrade ctl twapbuy --ceiling 1.40      # or `twapbuy max 1.40` on Telegram
+```
+
+The slow sell reflected: every unit of cash is spent, and cash deposited while
+it runs is simply more to spend. It joins only prices where strangers already
+bid, at or under the ceiling, never above the best bid and never crossing;
+each order small beside its level, the best bids funded first, the queue kept,
+capped by the tape. It reads the flow the other way round: sellers hitting the
+bids are its fills, so it shows more, and buyers lifting the asks is a market
+running away, so it adds nothing. The ceiling is required.
+
+`--budget 10000` caps it at that much quote currency instead of every unit of
+cash: counted from its own fills plus what its open bids hold, it halts once
+spent. Any other slow buy leaves the unspent part alone, so a budgeted buy can
+run beside one that takes everything else:
+
+```sh
+safetrade ctl twapbuy --asset noid --ceiling 0.37 --budget 10000   # $10k of NOID
+safetrade ctl twapbuy --asset prl  --ceiling 2.00                  # the rest into PRL
+```
+
+It is the same code as the sell, run on negated prices (`buy_ladder` in
+`src/strategy/sell.rs`), with its own `buy_*` knobs so tuning one side never
+moves the other. The flow window is shared (`sell_flow_mins`,
+`sell_flow_min_volume`).
 
 ## TWAP mode: put it all in, and nothing else
 

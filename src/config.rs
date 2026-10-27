@@ -834,7 +834,22 @@ pub const TUNABLE: &[(&str, &str)] = &[
     ("max_improve_ticks", "ticks we may post better than the touch; 0 = join only"),
     ("allow_taker", "allow crossing the spread to stay on schedule"),
     ("twap_spike_pct", "a twap stops buying while price is this % above the last hour's low; 0 = off"),
+    ("sell_hours", "the slow sell sells a holding out over about this many hours, never faster; 0 = no pace"),
+    ("twap_crash_pct", "a slow sell stops selling while price is this % below the last hour's high; 0 = off"),
     ("twap_hold", "true puts a running twap on hold; it keeps its schedule"),
+    ("slow_skip", "slow sell / slow buy: books to stay out of, comma-separated (e.g. prlusdc); its orders there are pulled; none = off"),
+    ("sell_qty", "slow sell: most the running program sells, counted from its own fills; 0 = everything"),
+    ("sell_near_levels", "slow sell: the lowest this many ask levels may take up to sell_near_pct of their size; 0 = off"),
+    ("sell_near_pct", "slow sell: one order on a near level is at most this % of the strangers' size there"),
+    ("sell_spike_rungs", "slow sell: how many bigger asks rest over the mid for a spike, each bigger than the one under it; 0 = off"),
+    ("sell_spike_step_pct", "slow sell: spike ask r (from 0) rests (r+1) times this % over the mid"),
+    ("sell_spike_pct", "slow sell: % of the holding the spike asks hold between them"),
+    ("sell_min_notional", "slow sell: on a small level an order may be bumped up to this much quote currency, past sell_level_pct; 0 = off"),
+    ("buy_min_notional", "slow buy: on a small level an order may be bumped up to this much quote currency, past buy_level_pct; 0 = off"),
+    ("buy_qty", "slow buy: most the running program receives, net of the fee, counted from its own fills; 0 = all the cash"),
+    ("then_buy_qty", "once a slow sell has sold everything, start a slow buy of this much (net), once; 0 = off"),
+    ("then_buy_ceiling", "the ceiling for that follow-on slow buy"),
+    ("then_buy_after_mins", "minutes the account must sit sold out, with no deposit arriving, before the follow-on buy starts"),
     ("sell_day_pct", "slow sell: most it sells in 24h, as % of the book's 24h volume"),
     ("sell_hour_pct", "slow sell: most it sells in an hour, as % of that hour's volume"),
     ("sell_levels", "slow sell: how many of the strangers' lowest ask levels get a new order"),
@@ -848,6 +863,16 @@ pub const TUNABLE: &[(&str, &str)] = &[
     ("sell_boost", "slow sell: size multiple at and above sell_boost_price"),
     ("sell_flow_mins", "slow sell: minutes of tape read for who is trading"),
     ("sell_flow_min_volume", "slow sell: under this much traded in that window, the flow is ignored"),
+    ("buy_day_pct", "slow buy: most it buys in 24h, as % of the book's 24h volume"),
+    ("buy_hour_pct", "slow buy: most it buys in an hour, as % of that hour's volume"),
+    ("buy_levels", "slow buy: how many of the strangers' best bid levels get a new order"),
+    ("buy_keep_levels", "slow buy: a resting bid is kept while within this many levels of the best"),
+    ("buy_level_pct", "slow buy: one order is at most this % of the strangers' size at its price"),
+    ("buy_max_order", "slow buy: most units in one order; 0 = no cap beyond the level's own size"),
+    ("buy_every_secs", "slow buy: seconds between re-planning the bids"),
+    ("buy_stand_back", "slow buy: no new bids while the flow (sellers minus buyers, over both) is at or under this"),
+    ("buy_boost_price", "slow buy: at and below this price, levels get buy_boost times the size; 0 = off"),
+    ("buy_boost", "slow buy: size multiple at and below buy_boost_price"),
     ("max_order_pct_of_depth", "cap one order at this fraction of book depth"),
     ("max_participation", "our max share of market volume in the window"),
     ("size_tolerance", "relative size drift before cancel/replace"),
@@ -1018,17 +1043,17 @@ mod tests {
         assert_eq!(stable.vol_spread_share, Some(Decimal::ZERO));
         assert!(stable.size_base.is_none(), "no fixed coin counts left");
         assert!(stable.max_order_notional.is_none());
-        let thin = cfg.overrides.get("prlusdc").expect("prlusdc override");
+        let thin = cfg.overrides.get("pearlusdc").expect("pearlusdc override");
         assert!(thin.max_order_notional.is_none() && thin.size_pct_of_equity.is_some());
-        // prlusdc is priced off prlusdt THROUGH usdcusdt's book, and a book is
+        // pearlusdc is priced off prlusdt THROUGH usdcusdt's book, and a book is
         // only read on the loops its market is due. A referenced book with no
         // cross this loop stands down (`Halt::NoReference`), so the two
-        // cadences must coincide or prlusdc would cancel and re-place its
+        // cadences must coincide or pearlusdc would cancel and re-place its
         // ladder on every loop the cross was not fetched.
         assert_eq!(
             thin.every_n_loops.unwrap_or(1),
             stable.every_n_loops.unwrap_or(1),
-            "prlusdc and usdcusdt must be due on the same loops"
+            "pearlusdc and usdcusdt must be due on the same loops"
         );
     }
 
@@ -1108,7 +1133,7 @@ mod tests {
             Params { q: cfg.quoting.clone(), risk: cfg.risk.clone(), enabled: true, dry_run: false }
                 .for_market(cfg.overrides.get(m))
         };
-        for m in ["prlusdt", "prlusdc"] {
+        for m in ["pearlusdt", "pearlusdc"] {
             assert!(!p(m).q.allow_taker, "{m} must never be crossed: one tick is a percent");
         }
         // And every OTHER market in the config, whatever it is called, unless it

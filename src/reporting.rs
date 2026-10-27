@@ -1235,6 +1235,24 @@ pub async fn held(db: &Db, ccy: &str) -> Decimal {
     v.map(|(a, l)| num::parse(&a) + num::parse(&l)).unwrap_or_default()
 }
 
+/// Every currency held, free plus locked, from the latest row per currency.
+/// Rounded to 4 places; dust that rounds to zero is left out. Sorted by currency name.
+pub async fn holdings(db: &Db) -> Vec<(String, Decimal)> {
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT b.currency, b.available, b.locked FROM balances b
+         JOIN (SELECT currency, MAX(ts) AS ts FROM balances GROUP BY currency) m
+           ON b.currency = m.currency AND b.ts = m.ts
+         ORDER BY b.currency",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap_or_default();
+    rows.into_iter()
+        .map(|(c, a, l)| (c, (num::parse(&a) + num::parse(&l)).round_dp(4).normalize()))
+        .filter(|(_, v)| !v.is_zero())
+        .collect()
+}
+
 /// How long ago, in one short word. Shared so that a resting order's age reads
 /// the same in the terminal report and in a chat message.
 pub fn age(ms: i64) -> String {
@@ -3116,6 +3134,8 @@ pub async fn sell_progress(db: &Db, base: &str, markets: &[String]) -> Result<Op
 
     let b = base.to_uppercase();
     let mut o = format!("💸 <b>Slow sell #{} — {b}</b>\n", p.id);
+    // The status line goes here, once the resting asks are known.
+    let head = o.len();
     o.push_str(&format!("{b} left: <b>{}</b>\n", held(db, base).await.round_dp(0)));
     o.push_str(&format!("Sold: <b>{} {b}</b> for {}", qty.round_dp(0), proceeds.round_dp(2)));
     o.push_str(&format!(" · running {}\n", dur(((now - p.started_at) / 1000).max(0))));
@@ -3145,11 +3165,12 @@ pub async fn sell_progress(db: &Db, base: &str, markets: &[String]) -> Result<Op
     let day_pct = db.setting_decimal("sell_day_pct", dec!(5)).await;
     let left = held(db, base).await;
     let pace = day_pct / dec!(100) * day_vol;
+    let hours = db.setting_decimal("sell_hours", Decimal::ZERO).await;
     o.push_str(&format!(
-        "Cap {day_pct}% of 24h volume (≈{} {b}/day) · never below {}{}\n",
+        "Cap {day_pct}% of 24h volume (≈{} {b}/day){} · never below {}\n",
         pace.round_dp(0),
+        if hours > Decimal::ZERO { format!(" · spread over ≥{}h", hours.normalize()) } else { String::new() },
         p.limit_price.map(|v| v.to_string()).unwrap_or_else(|| "1.30".into()),
-        if db.setting_bool("twap_hold", false).await { " · <b>ON HOLD</b>" } else { "" },
     ));
     if pace > Decimal::ZERO {
         let hours = left / pace * dec!(24);
@@ -3168,6 +3189,8 @@ pub async fn sell_progress(db: &Db, base: &str, markets: &[String]) -> Result<Op
     }
     resting.sort_by(|a, b| a.1.price.cmp(&b.1.price));
     let total: Decimal = resting.iter().map(|(_, r)| (r.amount - r.filled).max(Decimal::ZERO)).sum();
+    let status = sell_status(db, &books, &resting, left).await;
+    o.insert_str(head, &format!("Now: {status}\n"));
     o.push_str(&format!("\n<b>Asks resting ({}, {} {b})</b>\n<pre>", resting.len(), total.round_dp(0)));
     if resting.is_empty() {
         o.push_str("none\n");
@@ -3191,6 +3214,53 @@ pub async fn sell_progress(db: &Db, base: &str, markets: &[String]) -> Result<Op
     }
     o.push_str("</pre>");
     Ok(Some(o))
+}
+
+/// One line on what the slow sell is doing right now, so "why is nothing
+/// selling" has an answer on the screen (owner, 2026-10-27: "add a custom
+/// button so i can see what you are doing").
+async fn sell_status(db: &Db, books: &[String], resting: &[(String, crate::db::models::LiveOrder)], left: Decimal) -> String {
+    if !db.setting_bool("enabled", true).await {
+        return "⏸ <b>paused</b> — no orders".into();
+    }
+    if db.setting_bool("twap_hold", false).await {
+        return "✋ <b>on hold</b> — asks pulled".into();
+    }
+    // The same test the engine halts on: mid this far under the hour's high.
+    let crash = db.setting_decimal("twap_crash_pct", dec!(10)).await;
+    if crash > Decimal::ZERO {
+        for m in books {
+            let mid: Option<Decimal> = sqlx::query_scalar::<_, Option<String>>(
+                "SELECT mid FROM book_snapshots WHERE market = ? ORDER BY ts DESC LIMIT 1",
+            )
+            .bind(m)
+            .fetch_optional(db.pool())
+            .await
+            .ok()
+            .flatten()
+            .flatten()
+            .and_then(|s| s.parse().ok());
+            if let (Some(mid), Some(high)) = (mid, db.hour_high(m).await)
+                && high > Decimal::ZERO
+                && (high - mid) / high * dec!(100) > crash
+            {
+                return format!(
+                    "🛡 <b>crash guard</b> on {m} — {:.1}% under the hour's high, asks pulled until it recovers",
+                    (high - mid) / high * dec!(100)
+                );
+            }
+        }
+    }
+    if resting.is_empty() {
+        return if left < dec!(20) {
+            "waiting for a deposit".into()
+        } else {
+            "no asks — waiting for room under the caps, or for price over the floor".into()
+        };
+    }
+    let lo = resting.iter().map(|(_, r)| r.price).min().unwrap_or_default();
+    let hi = resting.iter().map(|(_, r)| r.price).max().unwrap_or_default();
+    format!("🟢 selling — {} asks from {} to {}, waiting for buyers", resting.len(), lo.round_dp(4), hi.round_dp(4))
 }
 
 pub fn render_compact(r: &Report) -> String {

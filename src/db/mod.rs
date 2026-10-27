@@ -171,6 +171,9 @@ impl Db {
         if !pcols.iter().any(|c| c == "banked") {
             sqlx::query("ALTER TABLE programs ADD COLUMN banked TEXT").execute(&self.pool).await?;
         }
+        if !pcols.iter().any(|c| c == "budget") {
+            sqlx::query("ALTER TABLE programs ADD COLUMN budget TEXT").execute(&self.pool).await?;
+        }
 
         // book_snapshots was keyed on ts alone, so three books sampled in the
         // same millisecond overwrote one another and two of the three were
@@ -851,7 +854,7 @@ impl Db {
     pub async fn active_program(&self, market: &str) -> Result<Option<Program>> {
         let row: Option<ProgramRow> = sqlx::query_as(
             "SELECT id, market, kind, state, start_qty, target_qty, ratio, banked, limit_price,
-                    started_at, ends_at, note
+                    budget, started_at, ends_at, note
              FROM programs WHERE market = ? AND state = 'active'
              ORDER BY id DESC LIMIT 1",
         )
@@ -1163,6 +1166,21 @@ impl Db {
             .min()
     }
 
+    /// The highest mid this book showed in the last hour, from the snapshots.
+    pub async fn hour_high(&self, market: &str) -> Option<Decimal> {
+        let mids: Vec<(Option<String>,)> =
+            sqlx::query_as("SELECT mid FROM book_snapshots WHERE market = ? AND ts >= ?")
+                .bind(market)
+                .bind(now_ms() - 3_600_000)
+                .fetch_all(&self.pool)
+                .await
+                .ok()?;
+        mids.iter()
+            .filter_map(|(m,)| num::opt_parse(m.as_deref()))
+            .filter(|m| *m > Decimal::ZERO)
+            .max()
+    }
+
     /// Base volume on the recorded public tape since `since_ms`.
     pub async fn tape_volume(&self, market: &str, since_ms: i64) -> Result<Decimal> {
         let rows: Vec<(String,)> = sqlx::query_as("SELECT amount FROM tape WHERE market = ? AND ts >= ?")
@@ -1186,7 +1204,7 @@ impl Db {
         };
         matches!(
             self.active_program(&base).await,
-            Ok(Some(p)) if p.kind == crate::db::models::ProgramKind::TwapSell
+            Ok(Some(p)) if p.kind.is_slow()
         )
     }
 
@@ -1212,10 +1230,90 @@ impl Db {
 
     /// Base we sold on `market` since `since_ms`, every fill counted.
     pub async fn sold_since(&self, market: &str, since_ms: i64) -> Result<Decimal> {
+        self.filled_since(market, "sell", since_ms).await
+    }
+
+    pub async fn bought_since(&self, market: &str, since_ms: i64) -> Result<Decimal> {
+        self.filled_since(market, "buy", since_ms).await
+    }
+
+    /// Everything one program has filled on one side, over every market.
+    /// Cap a slow buy at this much quote currency. See `Program::budget`.
+    pub async fn set_program_budget(&self, program_id: i64, budget: Decimal) -> Result<()> {
+        sqlx::query("UPDATE programs SET budget = ?, updated_at = ? WHERE id = ?")
+            .bind(num::to_str(budget))
+            .bind(now_ms())
+            .bind(program_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Quote currency one program's buys have spent, and what its open bids
+    /// hold: (spent, committed). A buy's fee is taken in the base, so what it
+    /// spent is its `total`.
+    pub async fn program_buy_spend(&self, program_id: i64) -> Result<(Decimal, Decimal)> {
+        let fills: Vec<(String,)> =
+            sqlx::query_as("SELECT total FROM fills WHERE program_id = ? AND side = 'buy'")
+                .bind(program_id)
+                .fetch_all(&self.pool)
+                .await?;
+        let open: Vec<(Option<String>, String, String)> = sqlx::query_as(
+            "SELECT price, amount, filled_amount FROM orders
+             WHERE program_id = ? AND side = 'buy' AND state IN ('wait','pending')",
+        )
+        .bind(program_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let spent = fills.iter().map(|(t,)| num::parse(t)).sum();
+        let committed = open
+            .iter()
+            .map(|(p, a, f)| {
+                let left = num::parse(a) - num::parse(f);
+                num::opt_parse(p.as_deref()).unwrap_or_default() * left.max(Decimal::ZERO)
+            })
+            .sum();
+        Ok((spent, committed))
+    }
+
+    pub async fn program_filled(&self, program_id: i64, side: &str) -> Result<Decimal> {
+        let rows: Vec<(String,)> =
+            sqlx::query_as("SELECT amount FROM fills WHERE program_id = ? AND side = ?")
+                .bind(program_id)
+                .bind(side)
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows.iter().map(|(a,)| num::parse(a)).sum())
+    }
+
+    /// What one program's buys have put in the account, net of fees taken in
+    /// `base`, and the gross bought: (net, gross).
+    pub async fn program_received(&self, program_id: i64, base: &str) -> Result<(Decimal, Decimal)> {
+        let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT amount, fee, fee_currency FROM fills WHERE program_id = ? AND side = 'buy'",
+        )
+        .bind(program_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut net = Decimal::ZERO;
+        let mut gross = Decimal::ZERO;
+        for (amount, fee, ccy) in &rows {
+            let a = num::parse(amount);
+            gross += a;
+            net += a;
+            if ccy.as_deref().is_some_and(|c| c.eq_ignore_ascii_case(base)) {
+                net -= num::parse(fee);
+            }
+        }
+        Ok((net, gross))
+    }
+
+    async fn filled_since(&self, market: &str, side: &str, since_ms: i64) -> Result<Decimal> {
         let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT amount FROM fills WHERE market = ? AND side = 'sell' AND created_at >= ?",
+            "SELECT amount FROM fills WHERE market = ? AND side = ? AND created_at >= ?",
         )
         .bind(market)
+        .bind(side)
         .bind(since_ms)
         .fetch_all(&self.pool)
         .await?;
@@ -2105,6 +2203,51 @@ impl Db {
 
 #[cfg(test)]
 mod tests {
+
+    /// A budget counts what the program's own buys spent plus what its open
+    /// bids still hold -- not other programs' fills, not sells, not closed
+    /// orders -- and survives the round trip through the programs row.
+    #[tokio::test]
+    async fn program_buy_spend_counts_own_fills_and_open_bids() {
+        let dir = tempdir::TempDir::new("safetrade-budget").unwrap();
+        let db = Db::open(&dir.path().join("t.db")).await.unwrap();
+        let id = db
+            .create_program("noid", ProgramKind::TwapBuy, Decimal::ZERO, Decimal::ZERO, None, Some(dec!(0.37)), None, None)
+            .await
+            .unwrap();
+        db.set_program_budget(id, dec!(10000)).await.unwrap();
+        assert_eq!(db.active_program("noid").await.unwrap().unwrap().budget, Some(dec!(10000)));
+        let other = db
+            .create_program("prl", ProgramKind::TwapBuy, Decimal::ZERO, Decimal::ZERO, None, Some(dec!(2)), None, None)
+            .await
+            .unwrap();
+        assert_eq!(db.active_program("prl").await.unwrap().unwrap().budget, None);
+
+        for (tid, pid, side, total) in [(1i64, id, "buy", "300"), (2, id, "buy", "200.5"), (3, id, "sell", "999"), (4, other, "buy", "999")] {
+            sqlx::query(
+                "INSERT INTO fills(trade_id, program_id, market, side, price, amount, total, fee, fee_currency, created_at)
+                 VALUES (?,?,'noidusdt',?,'0.33','1',?,'0','noid',1)",
+            )
+            .bind(tid).bind(pid).bind(side).bind(total)
+            .execute(db.pool()).await.unwrap();
+        }
+        for (cid, side, state, price, amount, filled) in [
+            ("a", "buy", "wait", "0.33", "1000", "400"),   // 600 left -> 198
+            ("b", "buy", "pending", "0.30", "100", "0"),   // 30
+            ("c", "buy", "done", "0.33", "1000", "0"),     // closed
+            ("d", "sell", "wait", "0.40", "1000", "0"),    // not a bid
+        ] {
+            sqlx::query(
+                "INSERT INTO orders(client_id, program_id, market, side, ord_type, price, amount, filled_amount, state, placed_at, updated_at)
+                 VALUES (?,?,'noidusdt',?,'limit',?,?,?,?,1,1)",
+            )
+            .bind(cid).bind(id).bind(side).bind(price).bind(amount).bind(filled).bind(state)
+            .execute(db.pool()).await.unwrap();
+        }
+        let (spent, committed) = db.program_buy_spend(id).await.unwrap();
+        assert_eq!(spent, dec!(500.5));
+        assert_eq!(committed, dec!(228));
+    }
 
     /// `cycle_legs` must report what a unit traded on each leg earned, with an
     /// error bar that reflects the RATIO it is, and must value a buy's fee --

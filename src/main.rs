@@ -166,6 +166,22 @@ enum Ctl {
         #[arg(long)]
         asset: Option<String>,
     },
+    /// Buy with every unit of cash, slowly: the slow sell worked down the bid
+    /// side. Bids only, joined to existing levels, never above a ceiling,
+    /// nothing else quoting. Cash deposits are simply more to spend. Pace via
+    /// `ctl set buy_day_pct` and friends.
+    Twapbuy {
+        /// Never pay above this. Required: there is no sensible default.
+        #[arg(long)]
+        ceiling: Decimal,
+        /// Which asset to buy. Defaults to the primary market's base.
+        #[arg(long)]
+        asset: Option<String>,
+        /// Spend at most this much quote currency (e.g. 10000 USDT), and hold
+        /// it back from any other slow buy. Without it, every unit of cash.
+        #[arg(long)]
+        budget: Option<Decimal>,
+    },
     /// Start an execution program.
     Program {
         /// neutral | accumulate | distribute | flatten
@@ -297,6 +313,9 @@ async fn main() -> Result<()> {
                     let every = std::time::Duration::from_secs(cfg.telegram_status_secs);
                     tokio::spawn(tg.clone().supervise("status", shutdown.clone(), move |t, s| {
                         t.hourly_loop(s, every)
+                    }));
+                    tokio::spawn(tg.clone().supervise("sell", shutdown.clone(), |t, s| {
+                        t.sell_loop(s, std::time::Duration::from_secs(1800))
                     }));
                     // No "started" message on a routine restart. A deploy is
                     // not news, and a chat that pings for non-events is a chat
@@ -670,6 +689,37 @@ async fn ctl(db: &Db, cfg: &Config, c: Ctl) -> Result<()> {
             Ok(())
         }
 
+        Ctl::Twapbuy { ceiling, asset, budget } => {
+            if ceiling <= Decimal::ZERO {
+                bail!("the ceiling must be a positive price");
+            }
+            if budget.is_some_and(|b| b <= Decimal::ZERO) {
+                bail!("the budget must be a positive amount");
+            }
+            let asset = match asset {
+                Some(a) => a.to_lowercase(),
+                None => db.program_key(&cfg.market).await.to_lowercase(),
+            };
+            queue(
+                db,
+                "program",
+                serde_json::json!({
+                    "kind": "twapbuy",
+                    "asset": asset,
+                    "limit_price": ceiling.to_string(),
+                    "budget": budget.map(|b| b.to_string()),
+                    "note": format!("twapbuy: every unit of cash into {}, slowly", asset.to_uppercase()),
+                }),
+            )
+            .await?;
+            match budget {
+                Some(b) => println!("  queued: slow buy of {} spending at most {b}, never above {ceiling}", asset.to_uppercase()),
+                None => println!("  queued: slow buy of {} with all the cash on the account, never above {ceiling}", asset.to_uppercase()),
+            }
+            println!("  bids only; every book that is not working this asset stands down");
+            Ok(())
+        }
+
         Ctl::Program { kind, target, over, limit_price, note } => {
             let k = ProgramKind::parse(&kind).ok_or_else(|| {
                 anyhow::anyhow!("kind must be one of: neutral, accumulate, distribute, flatten")
@@ -834,16 +884,16 @@ mod tests {
         assert_eq!(q.cycle_floor_bps, rust_decimal_macros::dec!(20));
         assert!(q.cycle_recycle_max_pct > rust_decimal::Decimal::ZERO);
         assert!(q.cycle_recycle_trigger > rust_decimal::Decimal::ZERO);
-        // And prlusdt is a leg, not a book we make markets on.
+        // And pearlusdt is a leg, not a book we make markets on.
         assert_eq!(
-            cfg.overrides.get("prlusdt").and_then(|o| o.cycle_leg_only),
+            cfg.overrides.get("pearlusdt").and_then(|o| o.cycle_leg_only),
             Some(true),
-            "prlusdt must be cycle-leg-only"
+            "pearlusdt must be cycle-leg-only"
         );
         // The one book that may be crossed, and only that one.
         assert!(!q.allow_taker, "the global must stay false");
         assert_eq!(cfg.overrides.get("usdcusdt").and_then(|o| o.allow_taker), Some(true));
-        assert_eq!(cfg.overrides.get("prlusdc").and_then(|o| o.allow_taker), None);
+        assert_eq!(cfg.overrides.get("pearlusdc").and_then(|o| o.allow_taker), None);
     }
 
     #[test]

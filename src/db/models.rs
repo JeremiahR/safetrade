@@ -66,6 +66,11 @@ pub enum ProgramKind {
     /// never crosses and never undercuts the best ask, and never sells below
     /// `limit_price`. See `strategy::sell`.
     TwapSell,
+    /// A slow buy with every unit of quote currency: the slow sell worked
+    /// down the bid side. A deposit of cash is simply more to spend. Joins
+    /// only existing bid levels, never above the best bid nor `limit_price`,
+    /// which it requires. See `strategy::sell::buy_ladder`.
+    TwapBuy,
 }
 
 impl ProgramKind {
@@ -79,6 +84,7 @@ impl ProgramKind {
             ProgramKind::Balanced => "balanced",
             ProgramKind::Learned => "learned",
             ProgramKind::TwapSell => "twapsell",
+            ProgramKind::TwapBuy => "twapbuy",
         }
     }
 
@@ -92,6 +98,7 @@ impl ProgramKind {
             "balanced" | "balance" | "rebalance" | "5050" => ProgramKind::Balanced,
             "learned" | "learn" | "auto" => ProgramKind::Learned,
             "twapsell" | "sellslow" => ProgramKind::TwapSell,
+            "twapbuy" | "buyslow" => ProgramKind::TwapBuy,
             _ => return None,
         })
     }
@@ -137,13 +144,20 @@ impl ProgramKind {
                 | ProgramKind::Flatten
                 | ProgramKind::Twap
                 | ProgramKind::TwapSell
+                | ProgramKind::TwapBuy
         )
     }
 
-    /// Whether this is one of the two twap programs, the ones TWAP mode
+    /// Whether this is one of the twap programs, the ones TWAP mode
     /// (`Quoting::twap_only`) lets quote while every other book stands down.
     pub fn is_twap(&self) -> bool {
-        matches!(self, ProgramKind::Twap | ProgramKind::TwapSell)
+        matches!(self, ProgramKind::Twap | ProgramKind::TwapSell | ProgramKind::TwapBuy)
+    }
+
+    /// Whether this is one of the two slow programs, paced by the tape and
+    /// laddered by `strategy::sell` rather than quoted by `plan`.
+    pub fn is_slow(&self) -> bool {
+        matches!(self, ProgramKind::TwapSell | ProgramKind::TwapBuy)
     }
 }
 
@@ -160,6 +174,7 @@ pub struct ProgramRow {
     pub ratio: Option<String>,
     pub banked: Option<String>,
     pub limit_price: Option<String>,
+    pub budget: Option<String>,
     pub started_at: i64,
     pub ends_at: Option<i64>,
     pub note: Option<String>,
@@ -188,6 +203,10 @@ pub struct Program {
     /// one-way rally.
     pub banked: Decimal,
     pub limit_price: Option<Decimal>,
+    /// `TwapBuy` only: the most quote currency this program spends, counted
+    /// from its own fills plus what its open bids hold. Other slow buys leave
+    /// the unspent part alone. `None` is every unit of cash.
+    pub budget: Option<Decimal>,
     pub started_at: i64,
     pub ends_at: Option<i64>,
     pub note: Option<String>,
@@ -208,6 +227,7 @@ impl TryFrom<ProgramRow> for Program {
             ratio: num::opt_parse(r.ratio.as_deref()),
             banked: num::opt_parse(r.banked.as_deref()).unwrap_or_default(),
             limit_price: num::opt_parse(r.limit_price.as_deref()),
+            budget: num::opt_parse(r.budget.as_deref()).filter(|b| *b > Decimal::ZERO),
             started_at: r.started_at,
             ends_at: r.ends_at,
             note: r.note,
@@ -244,7 +264,7 @@ impl Program {
 
             // Paced by the tape, not by inventory: there is no position to
             // steer toward, so the target is wherever inventory already is.
-            ProgramKind::TwapSell => pf.base_qty,
+            ProgramKind::TwapSell | ProgramKind::TwapBuy => pf.base_qty,
 
             ProgramKind::Accumulate | ProgramKind::Distribute => {
                 self.ramp(now, self.target_qty)
@@ -508,6 +528,7 @@ mod clock_tests {
             target_qty: dec!(0),
             ratio: None,
             limit_price: floor,
+            budget: None,
             started_at: 0,
             ends_at: Some(604_800_000),
             banked: Decimal::ZERO,
@@ -562,5 +583,17 @@ mod clock_tests {
         let p = selling(Some(dec!(1.40)));
         assert_eq!(p.clock_rate(Side::Sell, dec!(1.39), Decimal::ZERO, dec!(3)), Decimal::ZERO);
         assert_eq!(p.clock_rate(Side::Sell, dec!(2.00), Decimal::ZERO, dec!(3)), Decimal::ONE);
+    }
+
+    #[test]
+    fn the_slow_programs_round_trip_and_are_twaps() {
+        for (k, name) in [(ProgramKind::TwapSell, "twapsell"), (ProgramKind::TwapBuy, "twapbuy")] {
+            assert_eq!(k.as_str(), name);
+            assert_eq!(ProgramKind::parse(name), Some(k));
+            assert!(k.is_slow() && k.is_twap() && k.is_execution());
+            assert!(!k.is_scheduled(), "paced by the tape, never by a clock");
+        }
+        assert_eq!(ProgramKind::parse("buyslow"), Some(ProgramKind::TwapBuy));
+        assert!(!ProgramKind::Twap.is_slow(), "the scheduled twap is planned by `plan`");
     }
 }

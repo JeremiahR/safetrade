@@ -4,6 +4,10 @@ Description=Check the SafeTrade bot heartbeat every 5 minutes
 [Timer]
 OnBootSec=5min
 OnUnitActiveSec=5min
+# A wall-clock trigger too. OnUnitActiveSec alone stops re-arming once the
+# timer is restarted while its service is inactive: this one last fired on
+# 2026-09-30 and sat "elapsed" for three weeks with nothing watching.
+OnCalendar=*:0/5
 # Keep firing even if the machine was asleep or the last run was missed.
 Persistent=true
 
