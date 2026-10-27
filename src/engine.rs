@@ -2022,7 +2022,15 @@ impl Engine {
                 sold_day += self.db.sold_since(&m.id, day_ago).await.unwrap_or_default();
                 sold_window += self.db.sold_since(&m.id, window_ago).await.unwrap_or_default();
             }
-            let committed: Decimal = resting.iter().map(|r| r.remaining).sum();
+            // Spike asks sit well over the touch and only fill on a jump, so
+            // they do not use up the pace. Counting them let the rungs alone
+            // fill the window and kept every near ask off the book
+            // (2026-10-27).
+            let committed: Decimal = resting
+                .iter()
+                .filter(|r| r.level < crate::strategy::sell::SPIKE_LEVEL)
+                .map(|r| r.remaining)
+                .sum();
             Some(crate::strategy::sell::pace_room(
                 inventory,
                 sold_day,

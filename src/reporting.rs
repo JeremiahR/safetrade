@@ -3190,7 +3190,30 @@ pub async fn sell_progress(db: &Db, base: &str, markets: &[String]) -> Result<Op
     resting.sort_by(|a, b| a.1.price.cmp(&b.1.price));
     let total: Decimal = resting.iter().map(|(_, r)| (r.amount - r.filled).max(Decimal::ZERO)).sum();
     let status = sell_status(db, &books, &resting, left).await;
-    o.insert_str(head, &format!("Now: {status}\n"));
+    // The market price next to the status, per book: the touch and the last
+    // trade. Asked for on 2026-10-27.
+    let mut market = String::new();
+    for m in &books {
+        let touch: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT best_bid, best_ask FROM book_snapshots WHERE market = ? ORDER BY ts DESC LIMIT 1",
+        )
+        .bind(m)
+        .fetch_optional(db.pool())
+        .await?;
+        let last: Option<(String,)> = sqlx::query_as("SELECT price FROM tape WHERE market = ? ORDER BY ts DESC LIMIT 1")
+            .bind(m)
+            .fetch_optional(db.pool())
+            .await?;
+        let px = |v: Option<String>| v.map(|s| num::parse(&s).round_dp(4).to_string()).unwrap_or_else(|| "–".into());
+        let (bid, ask) = touch.unwrap_or_default();
+        market.push_str(&format!(
+            "Market {m}: bid {} / ask {} · last <b>{}</b>\n",
+            px(bid),
+            px(ask),
+            px(last.map(|l| l.0))
+        ));
+    }
+    o.insert_str(head, &format!("Now: {status}\n{market}"));
     o.push_str(&format!("\n<b>Asks resting ({}, {} {b})</b>\n<pre>", resting.len(), total.round_dp(0)));
     if resting.is_empty() {
         o.push_str("none\n");
